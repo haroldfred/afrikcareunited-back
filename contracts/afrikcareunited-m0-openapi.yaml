@@ -1,0 +1,5319 @@
+openapi: 3.1.1
+info:
+  title: AfrikCareUnited — API du module M0 Socle
+  version: 0.1.0
+  summary: Authentification, organisations, utilisateurs, rôles et journal d'audit.
+  description: |
+    Contrat écrit avant le code, à l'étape 6 du processus du cahier des charges v1.0 (section 4).
+    Il est relu par le commanditaire avant toute implémentation.
+
+    **Session.** Le navigateur ne détient aucun jeton : le back-end (BFF) garde les jetons
+    Keycloak et pose un cookie de session HttpOnly. Toute requête qui modifie l'état porte
+    l'en-tête X-XSRF-TOKEN. Toutes les réponses de l'API portent Cache-Control: no-store.
+
+    **Contexte.** La session porte l'organisation et l'établissement actifs, ou toute
+    l'organisation pour un rôle qui la couvre. Sur toute opération propre à une organisation,
+    l'application envoie l'en-tête ACU-Context avec le contexte qu'elle affiche :
+    `{organisation}/{établissement}` ou `{organisation}/all`. Absent : 400 `context-required` ;
+    différent de celui de la session, changé dans un autre onglet : 409 `context-mismatch`, et
+    rien n'est fait. Les permissions sont évaluées dans chaque établissement concerné.
+
+    **Double authentification.** Toutes les permissions du M0 sont des permissions
+    d'administration (RG-05) : elles exigent une session ouverte avec le second facteur.
+    Sinon 403 `mfa-enrollment-required` (à activer) ou `mfa-step-up-required` (à refaire).
+
+    **Activité et verrouillage.** Seules les requêtes déclenchées par la personne (clavier,
+    souris, toucher) portent l'en-tête ACU-Activity: user et repoussent le verrouillage ;
+    pendant une lecture sans requête, l'application envoie un signal d'activité au plus une
+    fois par minute. Après 15 minutes sans activité, la session est verrouillée et sa session
+    Keycloak fermée : toute requête répond 423 (`session-locked`, convention privée reprise de
+    la RFC 4918) jusqu'à la réauthentification. Exceptions : /config, /auth/*, GET /session
+    (vue réduite) et POST /session/lock. Le back-end compte lui-même les 12 h de session depuis
+    la première connexion.
+
+    **Erreurs.** Format RFC 9457 (application/problem+json), avec un `code` stable, la liste
+    des champs en erreur et une référence `traceId` à donner au support. `type` est une URL
+    https://{domaine de l'application}/problems/{code}. Les messages suivent l'en-tête
+    Accept-Language (fr ou en).
+
+    **Concurrence.** Les ressources versionnées renvoient un ETag fort : leur `version` entre
+    guillemets ("3"). PATCH et DELETE d'une ressource versionnée exigent If-Match : 412 si la
+    version a changé, 428 si l'en-tête manque.
+
+    **Idempotence.** Les créations portent un identifiant UUIDv7 choisi par le client : un
+    renvoi identique renvoie la ressource déjà créée (200), un renvoi différent répond 409.
+    Les actions sensibles exigent l'en-tête Idempotency-Key, une chaîne entre guillemets
+    (brouillon IETF, version 08). La clé vaut pour une organisation, un auteur, une méthode
+    et un chemin ; seules les réponses 2xx sont conservées, et la même clé rejouée sous 24 h
+    renvoie la première d'entre elles. Une erreur n'est pas conservée : la requête peut être
+    refaite avec la même clé. Afficher un téléphone, exporter le journal et émettre un
+    mot de passe provisoire n'en utilisent pas : chaque appel est une action nouvelle, inscrite
+    au journal.
+
+    **Isolation.** Une ressource d'une autre organisation répond 404, jamais 403, pour ne pas
+    révéler son existence. L'identifiant technique d'un utilisateur est propre à chaque
+    organisation. Un identifiant inconnu ou d'une autre organisation dans un corps de requête
+    répond 400 (`validation-failed`, champ en erreur `unknown-reference`).
+
+    **Pagination.** `page` (à partir de 0) et `size` (25 ou 50) ; la réponse donne `page`,
+    `size`, `totalItems` et `totalPages`.
+
+    **Évolution.** Les énumérations s'enrichissent à chaque module : un client doit accepter
+    une valeur inconnue. Les réponses peuvent gagner des champs ; les corps de requête
+    refusent les champs inconnus.
+
+    **Personnes protégées.** Un administrateur d'établissement n'agit que sur les personnes
+    dont toutes les affectations en cours ou à venir sont dans ses établissements, et dont il
+    détient tous les droits ; un administrateur d'organisation agit sur toutes (403
+    `target-out-of-scope`). Nul dans l'organisation ne change l'identifiant de connexion, ne
+    réinitialise la double authentification ni n'émet de mot de passe provisoire pour un
+    administrateur d'organisation ou un délégué à la protection des données (403
+    `protected-account`) : ils passent par leurs codes de secours ou par la procédure de la
+    plateforme.
+
+    Extensions : `x-permissions` liste les permissions exigées dans chaque établissement
+    concerné (`platform.operator` : membre habilité de l'équipe AfrikCareUnited, dans un realm
+    Keycloak à part, double authentification obligatoire) ; `x-target-scope` marque les
+    opérations soumises à la règle des personnes protégées ; `x-user-stories` donne les user
+    stories couvertes ; `x-audit-action` l'action, ou les actions possibles, inscrites au journal.
+  license:
+    name: Propriétaire, AfrikCareUnited
+servers:
+  - url: /api/v1
+    description: API JSON servie par le back-end, sur la même origine que l'application.
+security:
+  - sessionCookie: []
+tags:
+  - name: Auth
+    description: Parcours du navigateur vers Keycloak (redirections, hors JSON).
+  - name: Session
+    description: Session courante, contexte de travail, verrouillage et sessions actives.
+  - name: Home
+    description: Accueil de l'application.
+  - name: Me
+    description: 'Compte de la personne connectée : profil, sécurité, appartenances.'
+  - name: Invitations
+    description: Lire, accepter et refuser une invitation ; confirmer ou annuler un changement demandé par e-mail.
+  - name: Organization
+    description: Organisation active, ses établissements et les accès de support.
+  - name: Users
+    description: Utilisateurs de l'organisation active, invitations et actions de compte.
+  - name: Assignments
+    description: Affectations datées d'un utilisateur (établissement et rôles).
+  - name: Roles
+    description: Rôles système, rôles personnalisés et catalogue des permissions.
+  - name: Audit
+    description: Journal d'audit en ajout seul, consultation et export.
+  - name: Platform
+    description: Administration de la plateforme par l'équipe AfrikCareUnited.
+  - name: System
+    description: Configuration publique de l'application.
+
+paths:
+  /auth/login:
+    servers:
+      - url: /
+    get:
+      tags: [Auth]
+      operationId: startLogin
+      summary: Démarrer la connexion
+      description: >-
+        Redirige vers Keycloak (code d'autorisation avec PKCE). Si Keycloak ne répond pas, redirige
+        vers la page de connexion de l'application avec le motif, qui affiche « Serveur
+        injoignable ». Si une session verrouillée existe dans ce navigateur, Keycloak redemande le
+        mot de passe (prompt=login) et une autre personne qui se connecte ferme la session
+        verrouillée. Au retour, le back-end ouvre une nouvelle session (nouvel identifiant) et
+        redirige vers returnTo : un chemin de l'application, jamais « // », dont l'origine résolue
+        est vérifiée. Les membres de l'équipe AfrikCareUnited se connectent par leur realm à part.
+      security: []
+      parameters:
+        - name: returnTo
+          in: query
+          required: false
+          schema:
+            type: string
+            pattern: '^/(?!/)[A-Za-z0-9/_\-?=&%.]*$'
+            maxLength: 512
+      responses:
+        '302':
+          description: Redirection vers Keycloak, ou vers la page de connexion de l'application si Keycloak ne répond pas.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+      x-user-stories: [US-01]
+
+  /auth/reauth:
+    servers:
+      - url: /
+    get:
+      tags: [Auth]
+      operationId: startReauthentication
+      summary: Réauthentifier pour déverrouiller l'écran
+      description: >-
+        Ouvert dans une fenêtre séparée par le bouton Déverrouiller, seulement quand la session est
+        verrouillée ; sa session Keycloak a été fermée au verrouillage, et le back-end ignore la
+        déconnexion que Keycloak lui signale pour cette session. Redirige vers Keycloak avec
+        prompt=login, max_age=0 et l'identifiant pré-rempli. Au retour, le back-end vérifie lui-même
+        le jeton d'identité : même personne (sub), authentification postérieure au verrouillage
+        (auth_time) et second facteur si la personne en a un (amr). Si tout concorde, la session est
+        déverrouillée et rattachée à la nouvelle session Keycloak ; sinon, ou si une autre personne
+        s'est connectée, la session verrouillée est fermée et la saisie effacée. La fenêtre prévient
+        la page par BroadcastChannel ; si le navigateur l'empêche de se fermer, elle invite à la fermer.
+      parameters:
+        - name: popup
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '302':
+          description: Redirection vers Keycloak.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      x-user-stories: [US-11]
+      x-audit-action: auth.session.unlocked
+
+  /auth/account-action:
+    servers:
+      - url: /
+    post:
+      tags: [Auth]
+      operationId: startAccountAction
+      summary: Lancer une action de compte Keycloak
+      description: >-
+        Action initiée par l'application (paramètre kc_action de Keycloak) : ajouter une application
+        d'authentification, générer des codes de secours, changer le mot de passe, ou retirer une
+        application d'authentification (delete_credential). Renvoie l'adresse Keycloak où
+        l'application se rend ; Keycloak redemande le mot de passe, puis revient sur Mon compte. La
+        console de compte de Keycloak est désactivée : ces actions passent toutes par ici.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountActionRequest'
+      responses:
+        '200':
+          description: Adresse de l'action Keycloak.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RedirectTarget'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-user-stories: [US-02, US-10]
+
+  /auth/logout:
+    servers:
+      - url: /
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Se déconnecter
+      description: >-
+        Ferme la session du back-end, révoque les jetons et renvoie l'adresse de déconnexion
+        Keycloak que le navigateur doit ouvrir.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      responses:
+        '200':
+          description: Session fermée.
+          headers:
+            Clear-Site-Data:
+              $ref: '#/components/headers/ClearSiteData'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogoutResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      x-user-stories: [US-01]
+      x-audit-action: auth.session.closed
+
+  /config:
+    get:
+      tags: [System]
+      operationId: getPublicConfig
+      summary: Configuration publique
+      description: Environnement, bandeau de démonstration et langues proposées, lus avant la connexion.
+      security: []
+      responses:
+        '200':
+          description: Configuration.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicConfig'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /session:
+    get:
+      tags: [Session]
+      operationId: getSession
+      summary: Lire la session courante
+      description: >-
+        Identité, contexte actif, permissions effectives et état de verrouillage. Répond même quand la session est verrouillée, avec une vue réduite, pour que l'écran de verrouillage s'affiche.
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Session ouverte.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      x-user-stories: [US-01, US-03, US-11]
+
+  /session/context:
+    put:
+      tags: [Session]
+      operationId: setSessionContext
+      summary: Choisir ou changer l'établissement actif
+      description: >-
+        Change l'établissement actif, ou passe à toute l'organisation (establishmentId null) si l'un des rôles de la personne la couvre. Les autres onglets le découvrent par 409 context-mismatch.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionContextUpdate'
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Contexte mis à jour.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-user-stories: [US-03]
+      x-audit-action: context.establishment.selected
+
+  /session/establishments:
+    get:
+      tags: [Session]
+      operationId: listSelectableEstablishments
+      summary: Lister les établissements où l'utilisateur peut travailler aujourd'hui
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Établissements regroupés par organisation, le dernier utilisé en tête.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SelectableOrganization'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-user-stories: [US-03]
+
+  /session/heartbeat:
+    post:
+      tags: [Session]
+      operationId: sendHeartbeat
+      summary: Signaler une activité de l'utilisateur
+      description: >-
+        Signal d'activité, envoyé au plus une fois par minute pendant une saisie, avec
+        ACU-Activity: user. Sans cet en-tête, il ne repousse pas le verrouillage.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      responses:
+        '204':
+          description: Activité enregistrée.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-user-stories: [US-11]
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+
+  /session/lock:
+    post:
+      tags: [Session]
+      operationId: lockSession
+      summary: Verrouiller la session maintenant
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '204':
+          description: Session verrouillée.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      x-user-stories: [US-11]
+      x-audit-action: auth.session.locked
+
+  /session/sessions:
+    get:
+      tags: [Session]
+      operationId: listMySessions
+      summary: Lister mes sessions actives
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Sessions ouvertes, la session courante marquée.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SessionSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-user-stories: [US-10]
+
+  /session/sessions/{sessionId}:
+    delete:
+      tags: [Session]
+      operationId: revokeMySession
+      summary: Fermer une de mes autres sessions
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '204':
+          description: Session fermée, y compris côté Keycloak.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-user-stories: [US-10]
+      x-audit-action: auth.session.closed
+
+  /session/sessions/revoke-others:
+    post:
+      tags: [Session]
+      operationId: revokeOtherSessions
+      summary: Fermer toutes mes autres sessions
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Nombre de sessions fermées.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [closedSessions]
+                properties:
+                  closedSessions:
+                    type: integer
+                    minimum: 0
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-user-stories: [US-10]
+      x-audit-action: auth.session.closed
+
+  /home/tasks:
+    get:
+      tags: [Home]
+      operationId: listHomeTasks
+      summary: Éléments « À traiter » de l'accueil
+      description: >-
+        Invitations qui expirent dans les 48 heures, comptes bloqués, affectations qui se
+        terminent dans les 14 jours et demandes d'accès de support en attente. Seulement ce
+        que l'acteur peut traiter dans le contexte actif ; liste vide sinon.
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Éléments, les plus urgents en tête.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 20
+                items:
+                  $ref: '#/components/schemas/HomeTask'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-user-stories: [US-04, US-06, US-09]
+
+  /me:
+    get:
+      tags: [Me]
+      operationId: getMe
+      summary: Lire mon compte
+      description: L'état de la double authentification est relu dans Keycloak à chaque appel.
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Compte de l'utilisateur connecté.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-user-stories: [US-10]
+    patch:
+      tags: [Me]
+      operationId: updateMe
+      summary: Modifier ma langue ou mes coordonnées
+      description: >-
+        Nom, téléphone, langue et adresse e-mail de la personne connectée. Une nouvelle adresse ne
+        s'applique qu'après confirmation par le lien qui lui est envoyé ; l'ancienne reçoit un avis
+        avec un lien d'annulation.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/UserActivity'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/MeUpdate'
+      responses:
+        '200':
+          description: Compte modifié.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+      x-user-stories: [US-10]
+      x-audit-action: [user.updated, user.login-change.requested]
+
+  /me/security-events:
+    get:
+      tags: [Me]
+      operationId: listMySecurityEvents
+      summary: Lister les événements de sécurité de mon identité
+      description: >-
+        Connexions réussies et échouées, blocages, changements de mot de passe et de double
+        authentification, toutes organisations confondues. Ils ne figurent pas dans le
+        journal des organisations, qui ne voient que les connexions faites chez elles.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Événements, du plus récent au plus ancien.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdentitySecurityEventPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-user-stories: [US-10]
+
+  /me/memberships/{organizationId}/leave:
+    post:
+      tags: [Me]
+      operationId: leaveOrganization
+      summary: Quitter une organisation
+      description: >-
+        Termine l'appartenance de la personne connectée à cette organisation et ses affectations,
+        même si elle est suspendue ; l'application demande d'abord une confirmation à l'écran.
+        Refusé au dernier administrateur d'organisation (409). Inscrit au journal de
+        l'organisation ; les autres organisations n'en sont pas informées.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Appartenance terminée ; la session reste ouverte pour les autres organisations.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-user-stories: [US-10]
+      x-audit-action: user.membership.left
+
+  /invitations/inspect:
+    post:
+      tags: [Invitations]
+      operationId: inspectInvitation
+      summary: Lire une invitation reçue
+      description: >-
+        Appelé par la page de l'invitation avec le jeton lu dans le fragment du lien (#), que la page
+        retire aussitôt de la barre d'adresse et de l'historique. Ne révèle rien d'autre que
+        l'invitation elle-même. 423 si une session verrouillée existe dans ce navigateur.
+      security:
+        - {}
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvitationAcceptance'
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Invitation et prochaine étape pour la personne.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvitationPreview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+      x-user-stories: [US-04]
+
+  /invitations/accept:
+    post:
+      tags: [Invitations]
+      operationId: acceptInvitation
+      summary: Accepter une invitation
+      description: >-
+        Nouvelle personne : le compte Keycloak est créé à la première acceptation, sans mot de passe,
+        et Keycloak envoie l'e-mail de création du mot de passe (lien de 30 minutes) ; jusqu'à la
+        première connexion, et au plus 72 h après l'envoi de l'invitation, un nouvel appel avec le
+        même jeton renvoie cet e-mail (202, limité en fréquence). L'appartenance devient active à la
+        première connexion. Personne déjà inscrite : elle doit être connectée avec l'identité
+        invitée ; l'appartenance devient active aussitôt et le lien ne sert plus. 423 si une session
+        verrouillée existe dans ce navigateur.
+      security:
+        - {}
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvitationAcceptance'
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Appartenance activée ; l'établissement peut être choisi.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionView'
+        '202':
+          description: Nouvelle personne ; l'e-mail Keycloak de création du mot de passe est envoyé.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordSetupSent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+      x-user-stories: [US-04]
+      x-audit-action: user.invitation.accepted
+
+  /invitations/decline:
+    post:
+      tags: [Invitations]
+      operationId: declineInvitation
+      summary: Refuser une invitation
+      description: >-
+        L'invitation est close et l'appartenance terminée ; l'organisation qui invitait voit
+        « Invitation refusée ». Aucune autre organisation n'en est informée. Pour une personne déjà
+        inscrite, il faut être connecté avec l'identité invitée (401 sinon).
+      security:
+        - {}
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvitationAcceptance'
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '204':
+          description: Invitation refusée.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+      x-user-stories: [US-04]
+      x-audit-action: user.invitation.declined
+
+  /account-confirmations/inspect:
+    post:
+      tags: [Invitations]
+      operationId: inspectAccountConfirmation
+      summary: Lire une confirmation demandée par e-mail
+      description: >-
+        Changement d'adresse e-mail, annulation de ce changement depuis l'ancienne adresse,
+        réinitialisation de la double authentification ou opposition à la nomination d'un
+        administrateur de secours. Le jeton est lu dans le fragment du lien. 423 si une session
+        verrouillée existe dans ce navigateur.
+      security:
+        - {}
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmationReference'
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Objet de la confirmation et prochaine étape.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfirmationPreview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+      x-user-stories: [US-02, US-06, US-09, US-10]
+
+  /account-confirmations/confirm:
+    post:
+      tags: [Invitations]
+      operationId: confirmAccountChange
+      summary: Confirmer un changement demandé par e-mail
+      description: >-
+        Nouvelle adresse e-mail : appliquée aussitôt, et Keycloak mis à jour. Réinitialisation de la
+        double authentification : la réponse donne la page Keycloak (client acu-confirm, avec
+        prompt=login et max_age=0) où la personne doit saisir son mot de passe, même si une session
+        Keycloak est ouverte dans ce navigateur. Au retour, le back-end exige la même personne (sub)
+        et une authentification postérieure à l'envoi du lien (auth_time) ; sinon rien n'est fait. Le
+        changement est revérifié à ce moment (par exemple, une appartenance apparue entre-temps
+        l'annule). 423 si une session verrouillée existe dans ce navigateur.
+      security:
+        - {}
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmationReference'
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Changement appliqué, ou mot de passe à saisir.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfirmationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+      x-user-stories: [US-02, US-06, US-10]
+      x-audit-action: [user.login-change.confirmed, auth.mfa.reset]
+
+  /account-confirmations/cancel:
+    post:
+      tags: [Invitations]
+      operationId: cancelAccountChange
+      summary: Annuler un changement ou s'opposer à une nomination
+      description: >-
+        Depuis l'avis reçu à l'ancienne adresse, depuis la demande de réinitialisation, ou depuis
+        l'avis d'une nomination d'administrateur de secours : la demande est close et son auteur
+        prévenu. 423 si une session verrouillée existe dans ce navigateur.
+      security:
+        - {}
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmationReference'
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '204':
+          description: Demande annulée.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+      x-user-stories: [US-06, US-09, US-10]
+      x-audit-action: [user.login-change.cancelled, auth.mfa.reset.cancelled, organization.admin-recovery.vetoed]
+
+  /organization:
+    get:
+      tags: [Organization]
+      operationId: getOrganization
+      summary: Lire l'organisation active
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Organisation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-user-stories: [US-09]
+
+  /organization/establishments:
+    get:
+      tags: [Organization]
+      operationId: listEstablishments
+      summary: Lister les établissements de l'organisation
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Établissements, triés par nom.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Establishment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-user-stories: [US-09]
+    post:
+      tags: [Organization]
+      operationId: createEstablishment
+      summary: Ajouter un établissement
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EstablishmentCreate'
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Même identifiant et même contenu déjà reçus ; établissement existant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Establishment'
+        '201':
+          description: Établissement créé.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Establishment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [establishments.manage]
+      x-user-stories: [US-09]
+      x-audit-action: establishment.created
+
+  /organization/establishments/{establishmentId}:
+    parameters:
+      - $ref: '#/components/parameters/EstablishmentId'
+    get:
+      tags: [Organization]
+      operationId: getEstablishment
+      summary: Lire un établissement
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Établissement.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Establishment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-user-stories: [US-09]
+    patch:
+      tags: [Organization]
+      operationId: updateEstablishment
+      summary: Modifier un établissement
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/UserActivity'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/EstablishmentUpdate'
+      responses:
+        '200':
+          description: Établissement modifié.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Establishment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+      x-permissions: [establishments.manage]
+      x-user-stories: [US-09]
+      x-audit-action: establishment.updated
+
+  /organization/support-access:
+    get:
+      tags: [Organization]
+      operationId: listSupportAccess
+      summary: Lister les demandes et accès de support de l'organisation
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/SupportAccessStatus'
+          style: form
+          explode: false
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Demandes et accès, les plus récents en tête.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SupportAccess'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [support.decide]
+      x-user-stories: [US-09]
+
+  /organization/support-access/{supportAccessId}/approve:
+    post:
+      tags: [Organization]
+      operationId: approveSupportAccess
+      summary: Accorder un accès de support
+      description: L'accès commence à l'accord et s'arrête seul à la fin de la durée demandée.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/SupportAccessId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Accès accordé.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SupportAccess'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [support.decide]
+      x-user-stories: [US-09]
+      x-audit-action: support.granted
+
+  /organization/support-access/{supportAccessId}/deny:
+    post:
+      tags: [Organization]
+      operationId: denySupportAccess
+      summary: Refuser une demande d'accès de support
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/SupportAccessId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonInput'
+      responses:
+        '200':
+          description: Demande refusée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SupportAccess'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [support.decide]
+      x-user-stories: [US-09]
+      x-audit-action: support.denied
+
+  /organization/support-access/{supportAccessId}/revoke:
+    post:
+      tags: [Organization]
+      operationId: revokeSupportAccess
+      summary: Mettre fin à un accès de support en cours
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/SupportAccessId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Accès terminé.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SupportAccess'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [support.decide]
+      x-user-stories: [US-09]
+      x-audit-action: support.revoked
+
+  /users:
+    get:
+      tags: [Users]
+      operationId: listUsers
+      summary: Lister les utilisateurs
+      description: >-
+        Par défaut, les utilisateurs affectés à l'établissement actif. Un administrateur
+        d'organisation peut passer establishment=all. Recherche insensible à la casse et aux
+        accents sur le nom, l'e-mail, l'identifiant et le téléphone.
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - name: establishment
+          in: query
+          required: false
+          description: Identifiant d'établissement, ou all pour toute l'organisation.
+          schema:
+            type: string
+            pattern: '^(all|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 100
+          description: >-
+            Nom, e-mail ou identifiant de connexion, sans tenir compte des accents ni de la casse ;
+            un numéro de téléphone n'est trouvé qu'en entier.
+        - name: roleId
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/UserStatus'
+          style: form
+          explode: false
+        - name: mfa
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/MfaState'
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [name, -name, lastSeenAt, -lastSeenAt, status, -status]
+            default: name
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Page d'utilisateurs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [users.read]
+      x-user-stories: [US-05]
+    post:
+      tags: [Users]
+      operationId: inviteUser
+      summary: Inviter un utilisateur
+      description: |
+        Deux cas, choisis par le serveur :
+        - avec e-mail : l'application envoie un lien d'invitation à usage unique, valable 72 h,
+          par sa boîte d'envoi (état dans `invitation.delivery`). Que la personne soit nouvelle ou
+          déjà inscrite ailleurs, la réponse est la même ; aucun compte Keycloak n'est créé avant
+          l'acceptation ;
+        - sans e-mail : identifiant attribué, préfixé par le code de l'organisation, et mot de
+          passe provisoire valable 72 h, renvoyé une seule fois dans la réponse 201 (Cache-Control
+          no-store), changement imposé à la première connexion. Un renvoi de la même requête
+          répond 200 sans le mot de passe : en émettre un autre par /temporary-password.
+
+        L'acteur n'attribue que des rôles dont il détient toutes les permissions, dans des
+        établissements qu'il administre (403 sinon). Seul un administrateur d'organisation
+        attribue le rôle de délégué à la protection des données, jamais à lui-même ni à un agent
+        sans e-mail ; délégué et administrateur d'organisation ne vont jamais à la même personne,
+        à aucune date (409 role-combination-forbidden). Toute nomination d'un délégué est notifiée
+        au signataire du contrat et aux délégués en place.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvitationCreate'
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Même identifiant et même contenu déjà reçus ; invitation existante.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvitationResult'
+        '201':
+          description: Utilisateur invité.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvitationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+      x-permissions: [users.invite]
+      x-user-stories: [US-04]
+      x-audit-action: [user.invited, user.created]
+
+  /users/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Users]
+      operationId: getUser
+      summary: Lire la fiche d'un utilisateur
+      description: Le téléphone est masqué ; l'afficher en entier passe par /phone/reveal.
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Fiche.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [users.read]
+      x-user-stories: [US-05, US-06]
+    patch:
+      tags: [Users]
+      operationId: updateUser
+      summary: Modifier un utilisateur
+      description: >-
+        Fonction et politique de double authentification toujours modifiables. Nom, identifiant de
+        connexion, téléphone et langue seulement si profileManagedBy vaut organization ; sinon 409
+        identity-managed-by-user. Une nouvelle adresse e-mail ne s'applique qu'après confirmation
+        par le lien qui lui est envoyé (pendingLoginChange) ; l'ancienne reçoit un avis avec un lien
+        d'annulation. Jamais pour un administrateur d'organisation ou un délégué (403
+        protected-account). Un administrateur d'établissement doit avoir la personne dans sa
+        portée ; un administrateur d'organisation agit sur toutes (403 target-out-of-scope).
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/UserActivity'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/UserUpdate'
+      responses:
+        '200':
+          description: Fiche modifiée.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+      x-permissions: [users.update]
+      x-user-stories: [US-06]
+      x-audit-action: [user.updated, user.login-change.requested]
+
+      x-target-scope: true
+
+  /users/{userId}/invitation/resend:
+    post:
+      tags: [Users]
+      operationId: resendInvitation
+      summary: Renvoyer l'invitation
+      description: >-
+        Envoie un nouveau lien, valable 72 h ; l'ancien ne fonctionne plus (RG-12). Si une nouvelle
+        personne a déjà accepté sans encore créer son mot de passe, le nouveau lien la ramène à cette
+        étape. Pour un mot de passe provisoire, utiliser /temporary-password.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Invitation renvoyée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvitationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [users.invite]
+      x-user-stories: [US-04]
+      x-audit-action: user.invitation.resent
+
+      x-target-scope: true
+
+  /users/{userId}/invitation/cancel:
+    post:
+      tags: [Users]
+      operationId: cancelInvitation
+      summary: Annuler l'invitation
+      description: >-
+        Invalide le lien ou le mot de passe provisoire ; l'appartenance passe à ended. Un compte
+        Keycloak créé à l'acceptation et jamais utilisé est désactivé s'il ne sert à aucune autre
+        organisation.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Invitation annulée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [users.invite]
+      x-user-stories: [US-04]
+      x-audit-action: user.invitation.cancelled
+
+      x-target-scope: true
+
+  /users/{userId}/suspend:
+    post:
+      tags: [Users]
+      operationId: suspendUser
+      summary: Suspendre un utilisateur
+      description: >-
+        Motif obligatoire. Les sessions de la personne dans cette organisation sont fermées aussitôt
+        côté serveur : si elle ne travaille nulle part ailleurs, sa requête suivante répond 401 ;
+        sinon 403 membership-suspended, et l'application lui propose ses autres établissements.
+        Interdit sur soi-même, sur le dernier administrateur d'organisation et hors de la portée de
+        l'acteur.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SuspensionInput'
+      responses:
+        '200':
+          description: Utilisateur suspendu.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [users.suspend]
+      x-user-stories: [US-06]
+      x-audit-action: user.suspended
+
+      x-target-scope: true
+
+  /users/{userId}/reactivate:
+    post:
+      tags: [Users]
+      operationId: reactivateUser
+      summary: Réactiver un utilisateur suspendu
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Utilisateur réactivé.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [users.suspend]
+      x-user-stories: [US-06]
+      x-audit-action: user.reactivated
+
+      x-target-scope: true
+
+  /users/{userId}/end-membership:
+    post:
+      tags: [Users]
+      operationId: endMembership
+      summary: Mettre fin à l'appartenance d'une personne
+      description: >-
+        Fin de contrat ou départ : toutes les affectations se terminent à la date donnée, puis
+        l'appartenance passe à ended, qu'elle soit active ou suspendue ; une appartenance déjà
+        terminée répond 409 invalid-state. Motif obligatoire. Interdit sur soi-même, sur le dernier
+        administrateur d'organisation et hors de la portée de l'acteur.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MembershipEnd'
+      responses:
+        '200':
+          description: Fin enregistrée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [assignments.manage]
+      x-target-scope: true
+      x-user-stories: [US-06]
+      x-audit-action: user.membership.ended
+
+  /users/{userId}/unlock:
+    post:
+      tags: [Users]
+      operationId: unlockUser
+      summary: Débloquer un compte bloqué après 5 échecs
+      description: >-
+        Lève le blocage temporaire posé par Keycloak avant la fin des 15 minutes, seulement si
+        profileManagedBy vaut organization (409 identity-managed-by-user sinon : le blocage se lève
+        seul). L'acteur doit avoir la personne dans sa portée.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Compte débloqué.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+      x-permissions: [users.suspend]
+      x-user-stories: [US-01, US-06]
+      x-audit-action: auth.account.unlocked
+
+      x-target-scope: true
+
+  /users/{userId}/mfa/reset:
+    post:
+      tags: [Users]
+      operationId: resetUserMfa
+      summary: Réinitialiser la double authentification
+      description: >-
+        profileManagedBy organization : supprime l'application d'authentification et les codes de
+        secours ; la personne en enregistre une nouvelle à sa prochaine connexion et en est prévenue
+        (e-mail, ou message à la connexion sans e-mail). profileManagedBy person : un lien lui est
+        envoyé par e-mail (30 min), et la réinitialisation n'a lieu qu'après la saisie de son mot de
+        passe. Dans les deux cas, « Double authentification réinitialisée » est inscrit au journal
+        de chaque organisation où elle travaille. Refusé sur une invitation pas encore acceptée (409
+        invalid-state), pour un administrateur d'organisation ou un délégué (403 protected-account),
+        et hors de la portée de l'acteur.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Double authentification réinitialisée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MfaResetResult'
+        '202':
+          description: Confirmation demandée à la personne par e-mail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MfaResetResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+      x-permissions: [users.mfa.reset]
+      x-user-stories: [US-02]
+      x-audit-action: [auth.mfa.reset, auth.mfa.reset.requested]
+
+      x-target-scope: true
+
+  /users/{userId}/temporary-password:
+    post:
+      tags: [Users]
+      operationId: issueTemporaryPassword
+      summary: Émettre un nouveau mot de passe provisoire
+      description: >-
+        Pour un agent sans e-mail (identifiant attribué) : mot de passe perdu, oublié, expiré ou
+        réponse de création perdue. L'ancien mot de passe ne fonctionne plus et les sessions de
+        l'agent sont fermées ; le nouveau vaut 72 h et doit être changé à la première connexion.
+        Refusé pour une appartenance suspendue ou terminée (409), pour un administrateur
+        d'organisation ou un délégué (403 protected-account) et hors de la portée de l'acteur. Pas de
+        clé d'idempotence : chaque appel émet un mot de passe et s'inscrit au journal ; la réponse
+        n'est jamais conservée.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Mot de passe provisoire, à remettre en main propre.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TemporaryPasswordResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+      x-permissions: [users.mfa.reset]
+      x-user-stories: [US-04, US-06]
+      x-audit-action: user.temporary-password.issued
+
+      x-target-scope: true
+
+  /users/{userId}/phone/reveal:
+    post:
+      tags: [Users]
+      operationId: revealUserPhone
+      summary: Afficher le numéro de téléphone complet
+      description: Pour une personne visible dans l'établissement actif. Chaque appel est inscrit au journal ; impossible pendant un accès de support.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Numéro complet.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneReveal'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [users.read]
+      x-user-stories: [US-05]
+      x-audit-action: user.phone.revealed
+
+  /users/{userId}/history:
+    get:
+      tags: [Users]
+      operationId: getUserHistory
+      summary: Historique du compte
+      description: "Actions concernant cette personne dans l'organisation, sans adresse IP ni navigateur : ces détails restent dans le journal d'audit (audit.read)."
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Page d'entrées, les plus récentes en tête.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [users.read]
+      x-user-stories: [US-06]
+
+  /users/{userId}/assignments:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Assignments]
+      operationId: listAssignments
+      summary: Lister les affectations d'un utilisateur
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Affectations, en cours puis planifiées puis terminées.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Assignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [users.read]
+      x-user-stories: [US-06]
+    post:
+      tags: [Assignments]
+      operationId: createAssignment
+      summary: Ajouter une affectation
+      description: >-
+        Un administrateur d'établissement doit avoir la personne dans sa portée et administrer
+        l'établissement de l'affectation ; un administrateur d'organisation agit sur toutes les
+        personnes (403 target-out-of-scope). L'acteur n'attribue que des rôles dont il détient toutes
+        les permissions (403 privilege-escalation), sauf le rôle de délégué, que l'administrateur
+        d'organisation attribue, jamais à lui-même. Délégué et administrateur d'organisation ne vont
+        jamais à la même personne, à aucune date (409 role-combination-forbidden). L'organisation
+        garde, aujourd'hui et à toute date future, au moins un administrateur d'organisation actif
+        (409 last-organization-admin). Deux affectations d'une personne au même établissement, ou à
+        toute l'organisation, ne se chevauchent pas, dates de fin incluses (409).
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignmentInput'
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Même identifiant et même contenu déjà reçus ; affectation existante.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Assignment'
+        '201':
+          description: Affectation créée.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Assignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [assignments.manage]
+      x-user-stories: [US-06]
+      x-audit-action: assignment.created
+
+      x-target-scope: true
+
+  /users/{userId}/assignments/{assignmentId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/AssignmentId'
+    patch:
+      tags: [Assignments]
+      operationId: updateAssignment
+      summary: Modifier, prolonger ou terminer une affectation
+      description: >-
+        Un administrateur d'établissement doit avoir la personne dans sa portée et administrer
+        l'établissement de l'affectation ; un administrateur d'organisation agit sur toutes les
+        personnes (403 target-out-of-scope). L'acteur n'attribue que des rôles dont il détient toutes
+        les permissions (403 privilege-escalation), sauf le rôle de délégué, que l'administrateur
+        d'organisation attribue, jamais à lui-même. Délégué et administrateur d'organisation ne vont
+        jamais à la même personne, à aucune date (409 role-combination-forbidden). L'organisation
+        garde, aujourd'hui et à toute date future, au moins un administrateur d'organisation actif
+        (409 last-organization-admin). Deux affectations d'une personne au même établissement, ou à
+        toute l'organisation, ne se chevauchent pas, dates de fin incluses (409).
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/UserActivity'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/AssignmentUpdate'
+      responses:
+        '200':
+          description: Affectation modifiée.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Assignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+      x-permissions: [assignments.manage]
+      x-user-stories: [US-06]
+      x-audit-action: assignment.updated
+      x-target-scope: true
+    delete:
+      tags: [Assignments]
+      operationId: deletePlannedAssignment
+      summary: Supprimer une affectation qui n'a pas commencé
+      description: >-
+        Un administrateur d'établissement doit avoir la personne dans sa portée et administrer
+        l'établissement de l'affectation ; un administrateur d'organisation agit sur toutes les
+        personnes (403 target-out-of-scope). L'acteur n'attribue que des rôles dont il détient toutes
+        les permissions (403 privilege-escalation), sauf le rôle de délégué, que l'administrateur
+        d'organisation attribue, jamais à lui-même. Délégué et administrateur d'organisation ne vont
+        jamais à la même personne, à aucune date (409 role-combination-forbidden). L'organisation
+        garde, aujourd'hui et à toute date future, au moins un administrateur d'organisation actif
+        (409 last-organization-admin). Deux affectations d'une personne au même établissement, ou à
+        toute l'organisation, ne se chevauchent pas, dates de fin incluses (409).
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '204':
+          description: Affectation supprimée.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+      x-permissions: [assignments.manage]
+      x-user-stories: [US-06]
+      x-audit-action: assignment.deleted
+
+      x-target-scope: true
+
+  /roles:
+    get:
+      tags: [Roles]
+      operationId: listRoles
+      summary: Lister les rôles
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Rôles personnalisés de l'organisation puis rôles système, avec le nombre d'utilisateurs.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RoleSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [roles.read]
+      x-user-stories: [US-07]
+    post:
+      tags: [Roles]
+      operationId: duplicateRole
+      summary: Créer un rôle personnalisé en dupliquant un rôle
+      description: >-
+        Copie un rôle en rôle personnalisé de l'organisation. Refusé si le rôle source contient
+        une permission réservée (409 reserved-permission) ou que l'acteur ne détient pas (403
+        privilege-escalation).
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoleCreate'
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Même identifiant et même contenu déjà reçus ; rôle existant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleDetail'
+        '201':
+          description: Rôle créé.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [roles.manage]
+      x-user-stories: [US-07]
+      x-audit-action: role.created
+
+  /roles/{roleId}:
+    parameters:
+      - $ref: '#/components/parameters/RoleId'
+    get:
+      tags: [Roles]
+      operationId: getRole
+      summary: Lire un rôle et ses permissions
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Rôle.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [roles.read]
+      x-user-stories: [US-07]
+    patch:
+      tags: [Roles]
+      operationId: updateRole
+      summary: Modifier un rôle personnalisé
+      description: >-
+        Rôle personnalisé seulement (409 system-role-read-only). Les permissions ajoutées doivent
+        être détenues par l'acteur et non réservées ; la gestion des rôles est elle-même réservée à
+        l'administrateur d'organisation. La réponse indique le nombre de personnes concernées ; le
+        changement vaut dès leur requête suivante.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/UserActivity'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/RoleUpdate'
+      responses:
+        '200':
+          description: Rôle modifié.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+      x-permissions: [roles.manage]
+      x-user-stories: [US-07]
+      x-audit-action: role.updated
+
+  /permissions:
+    get:
+      tags: [Roles]
+      operationId: listPermissions
+      summary: Catalogue des permissions du M0
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Permissions regroupées comme dans l'écran Rôles.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PermissionGroup'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [roles.read]
+      x-user-stories: [US-07]
+
+  /audit-events:
+    get:
+      tags: [Audit]
+      operationId: listAuditEvents
+      summary: Consulter le journal d'audit
+      description: >-
+        Portée : toute l'organisation pour une affectation d'organisation (délégué, administrateur
+        d'organisation), sinon les établissements de l'acteur. Par défaut, la journée en cours
+        dans le fuseau de l'établissement actif.
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/AuditFrom'
+        - $ref: '#/components/parameters/AuditTo'
+        - $ref: '#/components/parameters/AuditActorId'
+        - $ref: '#/components/parameters/AuditActions'
+        - $ref: '#/components/parameters/AuditEstablishmentId'
+        - $ref: '#/components/parameters/AuditOutcome'
+        - $ref: '#/components/parameters/AuditTargetId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Page d'entrées, les plus récentes en tête.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [audit.read]
+      x-user-stories: [US-08]
+
+  /audit-events/actors:
+    get:
+      tags: [Audit]
+      operationId: listAuditActors
+      summary: Chercher un auteur dans le journal
+      description: >-
+        Alimente le filtre « Utilisateur » du journal, sans exiger users.read : seulement les
+        auteurs présents dans le journal visible de l'acteur.
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 100
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Au plus 20 auteurs.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 20
+                items:
+                  $ref: '#/components/schemas/AuditActor'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [audit.read]
+      x-user-stories: [US-08]
+
+  /audit-events/{eventId}:
+    get:
+      tags: [Audit]
+      operationId: getAuditEvent
+      summary: Lire une entrée du journal et vérifier son intégrité
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Entrée, avec le résultat de la vérification de la chaîne d'empreintes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [audit.read]
+      x-user-stories: [US-08]
+
+  /audit-events/export:
+    post:
+      tags: [Audit]
+      operationId: exportAuditEvents
+      summary: Exporter le journal en CSV
+      description: >-
+        Mêmes filtres que la consultation, 50 000 lignes au plus (422 export-too-large au-delà :
+        affiner les filtres). Le fichier est produit en flux ; toute cellule qui commence par
+        =, +, -, @, une tabulation ou un retour chariot est préfixée d'une apostrophe, pour
+        qu'un tableur ne l'exécute pas. Chaque export est inscrit au journal (RG-11).
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuditExportRequest'
+      parameters:
+        - $ref: '#/components/parameters/ExpectedContext'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Fichier CSV encodé en UTF-8, séparateur point-virgule.
+          headers:
+            Content-Disposition:
+              $ref: '#/components/headers/ContentDisposition'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            text/csv:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+      x-permissions: [audit.export]
+      x-user-stories: [US-08]
+      x-audit-action: audit.exported
+
+  /platform/organizations:
+    get:
+      tags: [Platform]
+      operationId: listPlatformOrganizations
+      summary: Lister les organisations clientes
+      description: Réservé à l'équipe AfrikCareUnited. Aucune donnée d'utilisateur ou de patient.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/OrganizationStatus'
+          style: form
+          explode: false
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Page d'organisations.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOrganizationPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-09]
+    post:
+      tags: [Platform]
+      operationId: createPlatformOrganization
+      summary: Ouvrir une organisation cliente
+      description: >-
+        Crée l'organisation, ses établissements et l'appartenance du premier administrateur,
+        qui reçoit un lien d'invitation de 72 h. L'équipe AfrikCareUnited ne voit ensuite de
+        cette personne que le nom saisi ici et l'état de l'invitation.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlatformOrganizationCreate'
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Même identifiant et même contenu déjà reçus ; organisation existante.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOrganizationDetail'
+        '201':
+          description: Organisation créée, en configuration jusqu'à l'activation du premier administrateur.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOrganizationDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-09]
+      x-audit-action: organization.created
+
+  /platform/organizations/{organizationId}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      tags: [Platform]
+      operationId: getPlatformOrganization
+      summary: Lire une organisation cliente
+      parameters:
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Organisation, établissements et accès de support.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOrganizationDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-09]
+    patch:
+      tags: [Platform]
+      operationId: updatePlatformOrganization
+      summary: Modifier une organisation cliente
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/UserActivity'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/PlatformOrganizationUpdate'
+      responses:
+        '200':
+          description: Organisation modifiée.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOrganizationDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-09]
+      x-audit-action: [organization.updated, organization.contract-contact.changed]
+
+      description: >-
+        Nom, langue, fuseau et signataire du contrat. Un changement de signataire est notifié à
+        l'ancien et au nouveau, et inscrit au journal de l'organisation.
+
+  /platform/organizations/{organizationId}/suspend:
+    post:
+      tags: [Platform]
+      operationId: suspendPlatformOrganization
+      summary: Suspendre une organisation
+      description: Toutes les sessions de l'organisation sont fermées ; motif obligatoire.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SuspensionInput'
+      responses:
+        '200':
+          description: Organisation suspendue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOrganizationDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-09]
+      x-audit-action: organization.suspended
+
+  /platform/organizations/{organizationId}/reactivate:
+    post:
+      tags: [Platform]
+      operationId: reactivatePlatformOrganization
+      summary: Réactiver une organisation suspendue
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Organisation réactivée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOrganizationDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-09]
+      x-audit-action: organization.reactivated
+
+  /platform/organizations/{organizationId}/establishments:
+    post:
+      tags: [Platform]
+      operationId: createPlatformEstablishment
+      summary: Ajouter un établissement à une organisation cliente
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationId'
+        - $ref: '#/components/parameters/UserActivity'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EstablishmentCreate'
+      responses:
+        '200':
+          description: Même identifiant et même contenu déjà reçus ; établissement existant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Establishment'
+        '201':
+          description: Établissement créé.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Establishment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-09]
+      x-audit-action: establishment.created
+
+  /platform/organizations/{organizationId}/first-admin-invitation/resend:
+    post:
+      tags: [Platform]
+      operationId: resendFirstAdminInvitation
+      summary: Renvoyer l'invitation du premier administrateur
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Invitation renvoyée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOrganizationDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-09]
+      x-audit-action: user.invitation.resent
+
+      description: Nouveau lien de 72 h pour le premier administrateur, tant qu'il n'a pas accepté ; l'ancien ne fonctionne plus.
+
+  /platform/organizations/{organizationId}/admin-recovery:
+    post:
+      tags: [Platform]
+      operationId: recoverOrganizationAdmin
+      summary: Nommer un administrateur de secours
+      description: >-
+        Quand l'organisation n'a plus d'administrateur joignable, sur demande écrite du client
+        (référence du ticket) : ouvre une procédure qu'un autre membre de l'équipe doit approuver.
+        Après approbation, l'invitation part au bout de 72 h si personne ne s'y oppose : le
+        signataire du contrat, son prédécesseur s'il a changé dans les 30 derniers jours, et les
+        administrateurs en place reçoivent un avis avec un lien d'opposition. Tout est inscrit au
+        journal de l'organisation.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlatformAdminRecovery'
+      responses:
+        '202':
+          description: Procédure ouverte, en attente d'approbation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminRecovery'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-09]
+      x-audit-action: organization.admin-recovery.requested
+
+  /platform/admin-recoveries/{recoveryId}/approve:
+    post:
+      tags: [Platform]
+      operationId: approveAdminRecovery
+      summary: Approuver la nomination d'un administrateur de secours
+      description: >-
+        Par un autre membre de l'équipe que le demandeur (409 second-operator-required). Ouvre
+        le délai de 72 h et envoie les avis d'opposition.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/RecoveryId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Procédure approuvée ; exécution prévue à executesAt.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminRecovery'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-09]
+      x-audit-action: organization.admin-recovery.approved
+
+  /platform/admin-recoveries/{recoveryId}/cancel:
+    post:
+      tags: [Platform]
+      operationId: cancelAdminRecovery
+      summary: Retirer une nomination d'administrateur de secours
+      description: >-
+        Par le demandeur ou par un autre membre de l'équipe, tant que l'invitation n'est pas
+        partie : la procédure passe à cancelled, et les personnes déjà prévenues le sont aussi.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/RecoveryId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SuspensionInput'
+      responses:
+        '200':
+          description: Procédure retirée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminRecovery'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-09]
+      x-audit-action: organization.admin-recovery.cancelled
+
+  /platform/organizations/{organizationId}/support-access:
+    post:
+      tags: [Platform]
+      operationId: requestSupportAccess
+      summary: Demander un accès de support
+      description: >-
+        Demande nominative : l'accès accordé ne vaudra que pour le membre qui la fait. Une demande
+        sans réponse expire au bout de 7 jours.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/UserActivity'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SupportAccessRequest'
+      responses:
+        '201':
+          description: Demande enregistrée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SupportAccess'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-09]
+      x-audit-action: support.requested
+
+  /platform/support-access/{supportAccessId}/enter:
+    post:
+      tags: [Platform]
+      operationId: enterSupportAccess
+      summary: Entrer dans une organisation en accès de support
+      description: >-
+        Réservé au membre de l'équipe qui a demandé l'accès, pendant sa durée. La session passe
+        en contexte de support, en lecture seule : permissions users.read, roles.read et
+        audit.read, plus la lecture de l'organisation et de ses établissements. Toute écriture
+        répond 403 support-read-only ; chaque consultation est inscrite au journal de
+        l'organisation, à son nom (support.data.viewed). La fin de l'accès vaut dès la requête
+        suivante.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/SupportAccessId'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Session en contexte de support.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-09]
+      x-audit-action: support.entered
+
+  /platform/support-access/{supportAccessId}/leave:
+    post:
+      tags: [Platform]
+      operationId: leaveSupportAccess
+      summary: Quitter l'accès de support
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/SupportAccessId'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Session revenue à l'administration de la plateforme.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-09]
+      x-audit-action: support.left
+
+  /platform/audit-events:
+    get:
+      tags: [Platform]
+      operationId: listPlatformAuditEvents
+      summary: Journal de la plateforme
+      description: >-
+        Journal de la plateforme. Les événements de l'identité y sont pseudonymisés : identifiant
+        technique de l'identité, empreinte de l'identifiant saisi, adresse IP tronquée, aucun nom.
+        Lire leur version complète passe par une procédure journalisée, réservée à l'enquête sur un
+        incident.
+      parameters:
+        - $ref: '#/components/parameters/AuditFrom'
+        - $ref: '#/components/parameters/AuditTo'
+        - $ref: '#/components/parameters/AuditActions'
+        - $ref: '#/components/parameters/AuditOutcome'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - $ref: '#/components/parameters/UserActivity'
+      responses:
+        '200':
+          description: Page d'entrées, les plus récentes en tête.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '423':
+          $ref: '#/components/responses/Locked'
+      x-permissions: [platform.operator]
+      x-user-stories: [US-08, US-09]
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-acu_session
+      description: >-
+        Cookie de session HttpOnly, Secure, SameSite=Lax, posé par le back-end après la
+        connexion Keycloak, renouvelé à chaque connexion. Aucun jeton OAuth n'est transmis
+        au navigateur.
+    csrfToken:
+      type: apiKey
+      in: header
+      name: X-XSRF-TOKEN
+      description: >-
+        Copie du cookie __Host-XSRF-TOKEN, exigée sur toute requête qui modifie l'état (POST,
+        PUT, PATCH, DELETE). Angular l'ajoute automatiquement, configuré avec ce nom de cookie.
+
+  headers:
+    ETag:
+      description: ETag fort, la `version` de la ressource entre guillemets, à renvoyer dans If-Match.
+      schema:
+        type: string
+        examples: ['"3"']
+    Location:
+      description: Adresse de la ressource créée ou de la redirection.
+      schema:
+        type: string
+        format: uri-reference
+    RetryAfter:
+      description: Délai avant un nouvel essai, en secondes.
+      schema:
+        type: integer
+        minimum: 1
+    ContentDisposition:
+      description: Nom du fichier téléchargé.
+      schema:
+        type: string
+        examples: ['attachment; filename="journal-audit-2026-10-23.csv"']
+    CacheControlNoStore:
+      description: La réponse ne doit être conservée par aucun cache.
+      schema:
+        type: string
+        const: no-store
+
+    ClearSiteData:
+      description: Efface le cache, les cookies et le stockage du site dans le navigateur.
+      schema:
+        type: string
+        examples: ['"cache", "cookies", "storage"']
+  parameters:
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: 'ETag fort lu avec la ressource, par exemple "3" : la valeur de `version` entre guillemets.'
+      schema:
+        type: string
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >-
+        Chaîne entre guillemets (champ structuré du brouillon IETF, version 08) contenant un
+        UUID choisi par le client, réutilisé tel quel en cas de nouvel essai. Absente : 400.
+      schema:
+        type: string
+        pattern: '^"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"$'
+        examples: ['"0192b1c4-7e3a-7c41-9f2d-5be0a8c3e219"']
+    Page:
+      name: page
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    Size:
+      name: size
+      in: query
+      required: false
+      schema:
+        type: integer
+        enum: [25, 50]
+        default: 25
+    UserId:
+      name: userId
+      in: path
+      required: true
+      description: Identifiant de l'utilisateur dans l'organisation active (différent dans chaque organisation).
+      schema:
+        type: string
+        format: uuid
+    AssignmentId:
+      name: assignmentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    RoleId:
+      name: roleId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    EstablishmentId:
+      name: establishmentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    OrganizationId:
+      name: organizationId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    SupportAccessId:
+      name: supportAccessId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    EventId:
+      name: eventId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      description: Identifiant opaque d'une session, tel que renvoyé par /session/sessions.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{22}$'
+    AuditFrom:
+      name: from
+      in: query
+      required: false
+      description: Début de période inclus ; par défaut, minuit dans le fuseau de l'établissement actif.
+      schema:
+        type: string
+        format: date-time
+    AuditTo:
+      name: to
+      in: query
+      required: false
+      description: Fin de période exclue ; par défaut, maintenant. La période couvre 366 jours au plus.
+      schema:
+        type: string
+        format: date-time
+    AuditActorId:
+      name: actorId
+      in: query
+      required: false
+      description: Identifiant de l'auteur dans l'organisation active.
+      schema:
+        type: string
+        format: uuid
+    AuditActions:
+      name: action
+      in: query
+      required: false
+      schema:
+        type: array
+        items:
+          $ref: '#/components/schemas/AuditAction'
+      style: form
+      explode: false
+    AuditEstablishmentId:
+      name: establishmentId
+      in: query
+      required: false
+      schema:
+        type: string
+        format: uuid
+    AuditOutcome:
+      name: outcome
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/AuditOutcome'
+
+    ExpectedContext:
+      name: ACU-Context
+      in: header
+      required: true
+      description: >-
+        Contexte affiché par l'application : identifiant de l'organisation, une barre oblique,
+        puis l'identifiant de l'établissement actif ou `all` pour toute l'organisation (aussi
+        pendant un accès de support). Absent : 400 context-required. Différent de celui de la
+        session (changé dans un autre onglet) : 409 context-mismatch, et rien n'est fait.
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/(all|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+        examples: ['0192b1c4-7e3a-7c41-9f2d-5be0a8c3e219/0192b1c4-7e3a-7c41-9f2d-5be0a8c3e220']
+    UserActivity:
+      name: ACU-Activity
+      in: header
+      required: false
+      description: >-
+        `user` sur une requête déclenchée par la personne (clavier, souris, toucher), et sur le
+        signal d'activité : seules celles-ci repoussent le verrouillage. Absent sur les
+        vérifications automatiques, les nouveaux essais et les rafraîchissements.
+      schema:
+        type: string
+        const: user
+    AuditTargetId:
+      name: targetId
+      in: query
+      required: false
+      description: Entrées dont la cible est cette ressource (utilisateur, rôle, établissement…).
+      schema:
+        type: string
+        format: uuid
+    RecoveryId:
+      name: recoveryId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    BadRequest:
+      description: Données invalides (`errors` liste les champs) ou en-tête ACU-Context absent (`context-required`).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Pas de session, ou session expirée.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: >-
+        Permission absente dans l'établissement concerné (`missingPermission`) ; double
+        authentification à activer (`mfa-enrollment-required`) ou à refaire pour cette session
+        (`mfa-step-up-required`) ; droit que l'acteur ne détient pas (`privilege-escalation`) ;
+        personne hors de sa portée (`target-out-of-scope`) ou protégée (`protected-account`) ;
+        écriture pendant un accès de support (`support-read-only`) ; appartenance suspendue dans
+        cette organisation alors que la session reste valable ailleurs (`membership-suspended`).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Ressource inconnue, ou appartenant à une autre organisation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Gone:
+      description: Lien d'invitation expiré, remplacé par un renvoi, annulé ou déjà utilisé (`invitation-no-longer-valid`).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: >-
+        État incompatible (`invalid-state`), identifiant déjà utilisé, chevauchement d'affectations,
+        dernier administrateur, modification de ses propres droits, rôle système en lecture seule,
+        permission réservée, rôles incompatibles (`role-combination-forbidden`), identité gérée par
+        la personne (`identity-managed-by-user`), contexte changé dans un autre onglet
+        (`context-mismatch`), approbation par le même membre de l'équipe
+        (`second-operator-required`).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PreconditionFailed:
+      description: La ressource a changé depuis sa lecture ; relire puis recommencer.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PreconditionRequired:
+      description: En-tête If-Match manquant.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnprocessableContent:
+      description: Clé d'idempotence déjà utilisée pour une requête différente, ou export trop volumineux (`export-too-large`).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Locked:
+      description: Session verrouillée après 15 minutes sans activité (`session-locked`) ; déverrouiller par /auth/reauth.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Trop de requêtes ; réessayer après le délai indiqué.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: "Keycloak ne répond pas : l'opération n'a pas abouti et peut être relancée sans risque."
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Problem:
+      type: object
+      description: Erreur au format RFC 9457.
+      required: [type, title, status, code, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: URL https://{domaine de l'application}/problems/{code}, qui décrit l'erreur en français et en anglais.
+          examples: [https://app.afrikcareunited.example/problems/last-organization-admin]
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        code:
+          $ref: '#/components/schemas/ProblemCode'
+        traceId:
+          type: string
+          description: Référence à donner au support, présente dans les journaux techniques.
+          examples: ['2c91-77ab']
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldError'
+        missingPermission:
+          oneOf:
+            - $ref: '#/components/schemas/PermissionCode'
+            - type: string
+              const: platform.operator
+        existingUserId:
+          type: string
+          format: uuid
+          description: Pour login-already-used, l'utilisateur de cette organisation qui porte déjà l'identifiant.
+        retryAfterSeconds:
+          type: integer
+          minimum: 1
+
+    ProblemCode:
+      type: string
+      enum:
+        - validation-failed
+        - context-required
+        - unauthenticated
+        - session-locked
+        - forbidden
+        - mfa-enrollment-required
+        - mfa-step-up-required
+        - privilege-escalation
+        - target-out-of-scope
+        - protected-account
+        - membership-suspended
+        - establishment-not-administered
+        - not-found
+        - invitation-no-longer-valid
+        - id-conflict
+        - login-already-used
+        - identity-managed-by-user
+        - overlapping-assignment
+        - last-organization-admin
+        - self-modification-forbidden
+        - system-role-read-only
+        - reserved-permission
+        - role-combination-forbidden
+        - role-scope-mismatch
+        - invalid-state
+        - context-mismatch
+        - support-access-pending
+        - support-read-only
+        - second-operator-required
+        - version-mismatch
+        - if-match-required
+        - idempotency-key-reuse
+        - rate-limited
+        - export-too-large
+        - dependency-unavailable
+        - internal-error
+
+    FieldError:
+      type: object
+      required: [pointer, code]
+      properties:
+        pointer:
+          type: string
+          description: Pointeur JSON (RFC 6901) vers le champ en erreur.
+          examples: ['/phone']
+        code:
+          type: string
+          examples: [required, format, too-long, already-used, before-start]
+        message:
+          type: string
+      additionalProperties: false
+
+    PageMeta:
+      type: object
+      required: [page, size, totalItems, totalPages]
+      properties:
+        page:
+          type: integer
+          minimum: 0
+        size:
+          type: integer
+          minimum: 1
+        totalItems:
+          type: integer
+          minimum: 0
+        totalPages:
+          type: integer
+          minimum: 0
+
+    Locale:
+      type: string
+      enum: [fr, en]
+
+    Uuid7:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+      description: UUID version 7 choisi par le client pour une création ; une autre version répond 400.
+
+    LogoutResult:
+      type: object
+      required: [logoutUrl]
+      properties:
+        logoutUrl:
+          type: string
+          format: uri
+          description: Adresse de déconnexion Keycloak, avec retour vers la page de connexion.
+
+    PublicConfig:
+      type: object
+      required: [environment, demoData, locales, defaultLocale]
+      properties:
+        environment:
+          type: string
+          enum: [development, test, staging, production]
+        demoData:
+          type: boolean
+          description: Vrai hors production ; affiche le bandeau « données fictives ».
+        locales:
+          type: array
+          items:
+            $ref: '#/components/schemas/Locale'
+        defaultLocale:
+          $ref: '#/components/schemas/Locale'
+
+    PermissionCode:
+      type: string
+      enum:
+        - users.read
+        - users.invite
+        - users.update
+        - assignments.manage
+        - users.suspend
+        - users.mfa.reset
+        - roles.read
+        - roles.manage
+        - audit.read
+        - audit.export
+        - establishments.manage
+        - support.decide
+
+    SessionView:
+      type: object
+      description: >-
+        Quand la session est verrouillée, la vue est réduite au nom, aux initiales, à la langue et à
+        l'état de verrouillage : les autres champs sont absents. Sinon, tous sont présents.
+      required: [user, locked, lockPolicy]
+      properties:
+        user:
+          $ref: '#/components/schemas/SessionUser'
+        context:
+          oneOf:
+            - $ref: '#/components/schemas/SessionContext'
+            - type: 'null'
+          description: Vide tant qu'aucun établissement n'est choisi.
+        permissions:
+          type: array
+          description: Permissions effectives dans l'établissement actif, aujourd'hui.
+          items:
+            $ref: '#/components/schemas/PermissionCode'
+        platformOperator:
+          type: boolean
+        mfaEnrollmentRequired:
+          type: boolean
+          description: Vrai si un rôle exige la double authentification et qu'elle n'est pas activée ; l'administration reste fermée.
+        locked:
+          type: boolean
+        lockPolicy:
+          $ref: '#/components/schemas/LockPolicy'
+
+        mfaSatisfied:
+          type: boolean
+          description: >-
+            La session a été ouverte avec le second facteur (revendication amr vérifiée par le
+            back-end). Les permissions du M0 l'exigent.
+        pendingInvitations:
+          type: array
+          description: Invitations reçues par la personne connectée, en attente de sa réponse, même si l'e-mail est perdu.
+          items:
+            $ref: '#/components/schemas/PendingInvitation'
+        supportAccess:
+          oneOf:
+            - $ref: '#/components/schemas/SupportAccess'
+            - type: 'null'
+          description: Accès de support en cours, quand un membre de l'équipe AfrikCareUnited est en mode support.
+
+    SessionUser:
+      type: object
+      required: [displayName, initials, locale]
+      properties:
+        userId:
+          type: [string, 'null']
+          format: uuid
+          description: Identifiant dans l'organisation active ; vide sans contexte.
+        displayName:
+          type: string
+        initials:
+          type: string
+          maxLength: 3
+        roleLabel:
+          type: [string, 'null']
+          description: Rôle principal dans l'établissement actif, affiché dans l'en-tête.
+        locale:
+          $ref: '#/components/schemas/Locale'
+        mfaEnabled:
+          type: boolean
+
+    SessionContext:
+      type: object
+      required: [scope, organization, establishment]
+      properties:
+        scope:
+          type: string
+          enum: [establishment, organization, support]
+          description: >-
+            Un établissement ; toute l'organisation, pour un rôle qui la couvre ; ou l'accès de
+            support en lecture seule d'un membre de l'équipe AfrikCareUnited.
+        organization:
+          $ref: '#/components/schemas/OrganizationRef'
+        establishment:
+          oneOf:
+            - $ref: '#/components/schemas/EstablishmentRef'
+            - type: 'null'
+          description: Vide pour une affectation d'organisation consultée sans établissement précis.
+
+    LockPolicy:
+      type: object
+      required: [idleSeconds, warningSeconds]
+      properties:
+        idleSeconds:
+          type: integer
+          const: 900
+        warningSeconds:
+          type: integer
+          const: 60
+
+    SessionContextUpdate:
+      type: object
+      required: [establishmentId]
+      properties:
+        establishmentId:
+          type: [string, 'null']
+          format: uuid
+          description: null pour toute l'organisation, si l'un des rôles de la personne la couvre.
+      additionalProperties: false
+
+    SelectableOrganization:
+      type: object
+      required: [organization, establishments, organizationWide]
+      properties:
+        organization:
+          $ref: '#/components/schemas/OrganizationRef'
+        establishments:
+          type: array
+          items:
+            $ref: '#/components/schemas/SelectableEstablishment'
+
+        organizationWide:
+          type: boolean
+          description: La personne peut choisir « Tous les établissements » (rôle couvrant l'organisation).
+
+    SelectableEstablishment:
+      type: object
+      required: [id, name, city, region, roleLabels, lastUsed]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        city:
+          type: string
+        region:
+          type: string
+        roleLabels:
+          type: array
+          items:
+            type: string
+        lastUsed:
+          type: boolean
+
+    SessionSummary:
+      type: object
+      required: [id, current, createdAt, lastAccessAt, device]
+      properties:
+        id:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{22}$'
+          description: >-
+            Identifiant opaque propre à cette liste, distinct de l'identifiant de session et du cookie :
+            le connaître ne permet pas de reprendre la session.
+        current:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        lastAccessAt:
+          type: string
+          format: date-time
+        ipAddress:
+          type: [string, 'null']
+        device:
+          type: string
+          description: Navigateur et système, par exemple « Chrome sur Windows ».
+        establishmentName:
+          type: [string, 'null']
+
+    PendingInvitation:
+      type: object
+      required: [id, organization, invitedBy, roleLabels, expiresAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        organization:
+          $ref: '#/components/schemas/OrganizationRef'
+        invitedBy:
+          type: string
+        roleLabels:
+          type: array
+          description: Rôles proposés et leurs établissements, par exemple « Infirmier, Clinique Les Palmiers ».
+          items:
+            type: string
+        expiresAt:
+          type: string
+          format: date-time
+
+    HomeTask:
+      type: object
+      required: [id, type, dueAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Identifiant de l'élément concerné (utilisateur, affectation ou accès de support).
+        type:
+          type: string
+          enum: [invitation_expiring, account_locked, assignment_ending, support_access_requested, support_access_active]
+        dueAt:
+          type: string
+          format: date-time
+          description: Expiration de l'invitation, fin du blocage, fin de l'affectation, date de la demande ou fin de l'accès de support en cours.
+        user:
+          oneOf:
+            - $ref: '#/components/schemas/UserRef'
+            - type: 'null'
+        assignmentId:
+          type: [string, 'null']
+          format: uuid
+        supportAccess:
+          oneOf:
+            - $ref: '#/components/schemas/SupportAccess'
+            - type: 'null'
+
+    UserRef:
+      type: object
+      required: [id, displayName]
+      properties:
+        id:
+          type: string
+          format: uuid
+        displayName:
+          type: string
+        roleLabel:
+          type: [string, 'null']
+
+    Me:
+      type: object
+      required: [givenName, familyName, login, locale, mfaEnabled, mfaRequired, version, mfaCredentials]
+      properties:
+        givenName:
+          type: string
+        familyName:
+          type: string
+        login:
+          $ref: '#/components/schemas/Login'
+        phone:
+          type: [string, 'null']
+          description: Numéro complet, visible par la personne elle-même.
+        locale:
+          $ref: '#/components/schemas/Locale'
+        mfaEnabled:
+          type: boolean
+        mfaRequired:
+          type: boolean
+          description: Vrai si l'un des rôles de la personne, dans l'une de ses organisations, exige la double authentification.
+        pendingLoginChange:
+          oneOf:
+            - $ref: '#/components/schemas/PendingLoginChange'
+            - type: 'null'
+        mfaCredentials:
+          type: array
+          description: Applications d'authentification enregistrées, pour remplacer celle d'un téléphone perdu.
+          items:
+            $ref: '#/components/schemas/MfaCredential'
+        recoveryCodesRemaining:
+          type: [integer, 'null']
+          minimum: 0
+        version:
+          type: integer
+
+    MfaCredential:
+      type: object
+      required: [id, label, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        label:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+
+    MeUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        givenName:
+          $ref: '#/components/schemas/PersonName'
+        familyName:
+          $ref: '#/components/schemas/PersonName'
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: >-
+            Nouvelle adresse : appliquée seulement après confirmation par le lien qui lui est envoyé
+            (72 h) ; l'ancienne adresse reçoit un avis avec un lien d'annulation. Une adresse en
+            attente compte déjà pour l'unicité.
+        phone:
+          oneOf:
+            - $ref: '#/components/schemas/PhoneNumber'
+            - type: 'null'
+        locale:
+          $ref: '#/components/schemas/Locale'
+      additionalProperties: false
+
+    PersonName:
+      type: string
+      minLength: 1
+      maxLength: 100
+      description: Lettres accentuées, espaces, apostrophes et traits d'union.
+
+    PhoneNumber:
+      type: string
+      pattern: '^(\+237[26][0-9]{8}|\+(?!237)[1-9][0-9]{7,14})$'
+      description: Format E.164 ; au Cameroun (+237), 9 chiffres commençant par 6 (mobile) ou 2 (fixe).
+
+    Login:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [email, username]
+        email:
+          type: [string, 'null']
+          format: email
+          maxLength: 254
+        username:
+          type: [string, 'null']
+          pattern: '^[a-z0-9]{2,10}\.[a-z0-9]([a-z0-9.-]{0,48}[a-z0-9])?$'
+          description: Identifiant attribué complet, préfixé par le code de l'organisation, par exemple bgv.a.ngono.
+      description: e-mail pour un identifiant e-mail, username pour un identifiant attribué.
+
+    LoginInput:
+      type: object
+      required: [type]
+      description: >-
+        Identifiant de connexion saisi. Pour un identifiant attribué, seule la partie qui suit
+        le préfixe est saisie ; le serveur ajoute le code de l'organisation et un point, ce qui
+        le rend unique sans rien révéler des autres organisations.
+      properties:
+        type:
+          type: string
+          enum: [email, username]
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        usernameLocalPart:
+          type: string
+          pattern: '^[a-z0-9]([a-z0-9.-]{0,48}[a-z0-9])?$'
+          description: Lettres minuscules, chiffres, point ou tiret, par exemple a.ngono.
+      additionalProperties: false
+
+    OrganizationRef:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+
+    EstablishmentRef:
+      type: object
+      required: [id, name, city]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        city:
+          type: string
+
+    OrganizationStatus:
+      type: string
+      enum: [configuring, active, suspended]
+
+    Organization:
+      type: object
+      required: [id, name, status, defaultLocale, establishmentCount, code, timezone]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        status:
+          $ref: '#/components/schemas/OrganizationStatus'
+        defaultLocale:
+          $ref: '#/components/schemas/Locale'
+        establishmentCount:
+          type: integer
+          minimum: 0
+
+        code:
+          type: string
+          pattern: '^[a-z0-9]{2,10}$'
+          description: Code court fixé à l'ouverture, préfixe des identifiants attribués, par exemple bgv.
+        timezone:
+          type: string
+          description: Fuseau de référence de l'organisation (période par défaut du journal, échéances), par exemple Africa/Douala.
+
+    EstablishmentType:
+      type: string
+      enum: [clinique, centre_medical, hopital, laboratoire, cabinet, pharmacie, autre]
+
+    Establishment:
+      type: object
+      required: [id, code, name, type, city, region, timezone, locale, currency, status, version]
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+          examples: [CLB-DLA]
+        name:
+          type: string
+        type:
+          $ref: '#/components/schemas/EstablishmentType'
+        city:
+          type: string
+        region:
+          type: string
+        timezone:
+          type: string
+          examples: [Africa/Douala]
+        locale:
+          $ref: '#/components/schemas/Locale'
+        currency:
+          type: string
+          examples: [XAF]
+        status:
+          type: string
+          enum: [active, closed]
+        version:
+          type: integer
+
+    EstablishmentCreate:
+      type: object
+      required: [id, code, name, type, city, region]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid7'
+        code:
+          type: string
+          pattern: '^[A-Z0-9][A-Z0-9-]{1,15}$'
+        name:
+          type: string
+          minLength: 2
+          maxLength: 120
+        type:
+          $ref: '#/components/schemas/EstablishmentType'
+        city:
+          type: string
+          minLength: 1
+          maxLength: 80
+        region:
+          type: string
+          minLength: 1
+          maxLength: 60
+        timezone:
+          type: string
+          default: Africa/Douala
+          maxLength: 64
+        locale:
+          $ref: '#/components/schemas/Locale'
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          default: XAF
+      additionalProperties: false
+
+    EstablishmentUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 120
+        type:
+          $ref: '#/components/schemas/EstablishmentType'
+        city:
+          type: string
+          minLength: 1
+          maxLength: 80
+        region:
+          type: string
+          minLength: 1
+          maxLength: 60
+        timezone:
+          type: string
+          maxLength: 64
+        locale:
+          $ref: '#/components/schemas/Locale'
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+        status:
+          type: string
+          enum: [active, closed]
+      additionalProperties: false
+
+    SupportAccessStatus:
+      type: string
+      enum: [requested, granted, denied, revoked, expired]
+
+    SupportAccess:
+      type: object
+      required: [id, organization, requestedBy, requestedAt, reason, durationHours, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        organization:
+          $ref: '#/components/schemas/OrganizationRef'
+        requestedBy:
+          type: string
+          description: "Membre de l'équipe AfrikCareUnited qui a fait la demande : l'accès accordé ne vaut que pour lui."
+        requestedAt:
+          type: string
+          format: date-time
+        reason:
+          type: string
+        durationHours:
+          type: integer
+          minimum: 1
+          maximum: 72
+        status:
+          $ref: '#/components/schemas/SupportAccessStatus'
+        decidedBy:
+          type: [string, 'null']
+        decidedAt:
+          type: [string, 'null']
+          format: date-time
+        startsAt:
+          type: [string, 'null']
+          format: date-time
+        endsAt:
+          type: [string, 'null']
+          format: date-time
+
+        requestExpiresAt:
+          type: [string, 'null']
+          format: date-time
+          description: Une demande sans réponse expire 7 jours après son envoi.
+
+    SupportAccessRequest:
+      type: object
+      required: [reason, durationHours]
+      properties:
+        reason:
+          type: string
+          minLength: 10
+          maxLength: 500
+        durationHours:
+          type: integer
+          minimum: 1
+          maximum: 72
+      additionalProperties: false
+
+    AccountActionRequest:
+      type: object
+      required: [action]
+      description: >-
+        remove-mfa-credential retire une application d'authentification (credentialId) ; permis si
+        aucun rôle n'exige la double authentification, ou si une autre application reste
+        enregistrée : on ajoute d'abord la nouvelle (configure-mfa), puis on retire l'ancienne.
+      properties:
+        action:
+          type: string
+          enum: [configure-mfa, configure-recovery-codes, update-password, remove-mfa-credential]
+        credentialId:
+          type: string
+          format: uuid
+      additionalProperties: false
+
+    RedirectTarget:
+      type: object
+      required: [redirectUrl]
+      properties:
+        redirectUrl:
+          type: string
+          format: uri
+
+    ReasonInput:
+      type: object
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+      additionalProperties: false
+
+    SuspensionInput:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 3
+          maxLength: 500
+      additionalProperties: false
+
+    UserStatus:
+      type: string
+      description: >-
+        activation_pending : invitation acceptée par une nouvelle personne, qui n'a pas encore créé
+        son mot de passe ni ouvert de session (limite : 72 h après l'envoi de l'invitation). ended :
+        invitation annulée ou refusée, ou appartenance terminée.
+      enum: [active, locked, invited, activation_pending, invitation_expired, suspended, ended]
+
+    MfaState:
+      type: string
+      enum: [enabled, not_enabled, pending]
+      description: pending pour une personne invitée qui n'a pas encore activé son compte.
+
+    MfaPolicy:
+      type: string
+      enum: [proposed, required]
+      description: required est imposé d'office quand un rôle d'administration est attribué.
+
+    UserSummary:
+      type: object
+      required: [id, displayName, initials, login, roleLabels, otherEstablishmentCount, status, mfa]
+      properties:
+        id:
+          type: string
+          format: uuid
+        displayName:
+          type: string
+        initials:
+          type: string
+          maxLength: 3
+        login:
+          $ref: '#/components/schemas/Login'
+        roleLabels:
+          type: array
+          description: Rôles dans l'établissement filtré.
+          items:
+            type: string
+        otherEstablishmentCount:
+          type: integer
+          minimum: 0
+          description: Autres établissements de l'organisation où la personne est affectée.
+        status:
+          $ref: '#/components/schemas/UserStatus'
+        statusUntil:
+          type: [string, 'null']
+          format: date-time
+          description: Fin du blocage, ou expiration de l'invitation.
+        mfa:
+          $ref: '#/components/schemas/MfaState'
+        lastSeenAt:
+          type: [string, 'null']
+          format: date-time
+          description: Dernière ouverture de session dans cette organisation.
+        assignmentEndsOn:
+          type: [string, 'null']
+          format: date
+          description: Fin de l'affectation dans l'établissement filtré, si elle est fixée.
+
+    UserPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/UserSummary'
+
+    InvitationKind:
+      type: string
+      enum: [email_link, temporary_password]
+      description: >-
+        Lien envoyé par e-mail, que la personne soit nouvelle ou déjà inscrite ailleurs (rien ne
+        les distingue pour l'organisation qui invite), ou mot de passe provisoire.
+
+    InvitationStatus:
+      type: string
+      enum: [pending, accepted, expired, cancelled, superseded, declined]
+
+    InvitationInfo:
+      type: object
+      required: [kind, status, sentAt, sentBy, expiresAt, delivery]
+      properties:
+        kind:
+          $ref: '#/components/schemas/InvitationKind'
+        status:
+          $ref: '#/components/schemas/InvitationStatus'
+        sentAt:
+          type: string
+          format: date-time
+        sentBy:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+          description: 72 h après l'envoi, pour un lien comme pour un mot de passe provisoire (RG-12).
+        delivery:
+          type: string
+          enum: [queued, sent, failed, not_applicable]
+          description: Envoi de l'e-mail par la boîte d'envoi, avec de nouveaux essais en cas d'échec ; not_applicable pour un mot de passe provisoire.
+        deliveredAt:
+          type: [string, 'null']
+          format: date-time
+
+    UserDetail:
+      type: object
+      description: Pour une invitation pas encore acceptée, nom, téléphone et langue sont ceux saisis par l'administrateur, jamais ceux de l'identité.
+      required: [id, givenName, familyName, displayName, login, locale, status, mfa, mfaPolicy, assignments, createdAt, createdBy, version, profileManagedBy, allowedActions, restrictions]
+      properties:
+        id:
+          type: string
+          format: uuid
+        givenName:
+          type: string
+        familyName:
+          type: string
+        displayName:
+          type: string
+        login:
+          $ref: '#/components/schemas/Login'
+        phoneMasked:
+          type: [string, 'null']
+          examples: ['+237 6•• •• •• 41']
+        jobTitle:
+          type: [string, 'null']
+        locale:
+          $ref: '#/components/schemas/Locale'
+          description: "Langue de l'identité : modifiable par un administrateur seulement si profileManagedBy vaut organization."
+        status:
+          $ref: '#/components/schemas/UserStatus'
+        statusUntil:
+          type: [string, 'null']
+          format: date-time
+        suspensionReason:
+          type: [string, 'null']
+        mfa:
+          $ref: '#/components/schemas/MfaState'
+        mfaPolicy:
+          $ref: '#/components/schemas/MfaPolicy'
+        invitation:
+          oneOf:
+            - $ref: '#/components/schemas/InvitationInfo'
+            - type: 'null'
+        assignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/Assignment'
+        lastSeenAt:
+          type: [string, 'null']
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        createdBy:
+          type: string
+        version:
+          type: integer
+
+          description: >-
+            Version de la fiche vue par l'organisation : somme des versions de l'appartenance et de
+            l'identité, qui ne font que croître. Toute modification de l'une ou de l'autre, faite ici,
+            depuis Mon compte ou dans une autre organisation, fait donc échouer un If-Match périmé (412).
+        profileManagedBy:
+          type: string
+          enum: [organization, person]
+          description: >-
+            organization : la personne n'a aucune autre appartenance (hors appartenances terminées),
+            aucune invitation en attente ailleurs, n'est pas membre de l'équipe AfrikCareUnited et a
+            accepté son invitation ; un administrateur peut modifier son nom, son identifiant de
+            connexion, son téléphone et sa langue, la débloquer et réinitialiser sa double
+            authentification. person : elle gère elle-même son profil, et une réinitialisation de sa
+            double authentification lui est demandée par e-mail, puis confirmée par son mot de passe.
+            Recalculé à chaque requête, et à la confirmation d'un changement.
+        allowedActions:
+          type: array
+          description: Actions que l'acteur peut faire sur cette personne, calculées par le serveur ; l'interface masque les autres.
+          items:
+            $ref: '#/components/schemas/UserAction'
+        pendingLoginChange:
+          oneOf:
+            - $ref: '#/components/schemas/PendingLoginChange'
+            - type: 'null'
+
+        restrictions:
+          type: array
+          description: Raisons qui masquent des actions, pour que l'interface les explique en termes neutres.
+          items:
+            type: string
+            enum: [profile_managed_by_person, protected_account, out_of_scope, invitation_pending]
+
+    UserAction:
+      type: string
+      enum: [update, manage_assignments, resend_invitation, cancel_invitation, suspend, reactivate, unlock, reset_mfa, issue_temporary_password, reveal_phone]
+
+    PendingLoginChange:
+      type: object
+      required: [email, requestedAt, expiresAt]
+      description: >-
+        Nouvelle adresse en attente : elle ne remplace l'ancienne qu'après confirmation par le
+        lien envoyé à cette adresse (valable 72 h) ; l'ancienne adresse reçoit un avis.
+      properties:
+        email:
+          type: string
+          format: email
+        requestedAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+
+    UserUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        givenName:
+          $ref: '#/components/schemas/PersonName'
+        familyName:
+          $ref: '#/components/schemas/PersonName'
+        login:
+          $ref: '#/components/schemas/LoginInput'
+        phone:
+          oneOf:
+            - $ref: '#/components/schemas/PhoneNumber'
+            - type: 'null'
+        jobTitle:
+          type: [string, 'null']
+          maxLength: 80
+        locale:
+          $ref: '#/components/schemas/Locale'
+        mfaPolicy:
+          $ref: '#/components/schemas/MfaPolicy'
+      additionalProperties: false
+
+    InvitationCreate:
+      type: object
+      description: "Les champs saisis ne modifient jamais une identité existante : ils servent à l'affichage jusqu'à l'acceptation."
+      required: [id, givenName, familyName, login, locale, mfaPolicy, assignments]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid7'
+        givenName:
+          $ref: '#/components/schemas/PersonName'
+        familyName:
+          $ref: '#/components/schemas/PersonName'
+        login:
+          $ref: '#/components/schemas/LoginInput'
+        phone:
+          oneOf:
+            - $ref: '#/components/schemas/PhoneNumber'
+            - type: 'null'
+        jobTitle:
+          type: [string, 'null']
+          maxLength: 80
+        locale:
+          $ref: '#/components/schemas/Locale'
+        mfaPolicy:
+          $ref: '#/components/schemas/MfaPolicy'
+        assignments:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/AssignmentInput'
+      additionalProperties: false
+
+    InvitationResult:
+      type: object
+      required: [user, invitation]
+      properties:
+        user:
+          $ref: '#/components/schemas/UserDetail'
+        invitation:
+          $ref: '#/components/schemas/InvitationInfo'
+        temporaryPassword:
+          type: string
+          minLength: 16
+          description: >-
+            Seulement dans la réponse 201 d'une invitation sans e-mail, jamais rejoué. Perdu ou
+            expiré : POST /users/{userId}/temporary-password.
+
+    TemporaryPasswordResult:
+      type: object
+      required: [login, temporaryPassword, expiresAt]
+      properties:
+        login:
+          $ref: '#/components/schemas/Login'
+        temporaryPassword:
+          type: string
+          minLength: 16
+          description: Affiché une seule fois ; jamais conservé par l'application.
+        expiresAt:
+          type: string
+          format: date-time
+          description: 72 h après l'émission ; passé ce délai, Keycloak le refuse et il faut en émettre un autre.
+
+    MfaResetResult:
+      type: object
+      required: [status, user]
+      properties:
+        status:
+          type: string
+          enum: [done, confirmation_requested]
+          description: >-
+            done : application d'authentification et codes de secours supprimés.
+            confirmation_requested : identité gérée par la personne ; la réinitialisation
+            n'a lieu qu'après sa confirmation par un lien reçu par e-mail, valable 30 min.
+        user:
+          $ref: '#/components/schemas/UserDetail'
+
+    InvitationAcceptance:
+      type: object
+      description: >-
+        Le jeton du lien reçu par e-mail, ou l'identifiant d'une invitation de la liste des
+        invitations en attente quand la personne invitée est connectée.
+      minProperties: 1
+      maxProperties: 1
+      properties:
+        token:
+          type: string
+          minLength: 32
+          maxLength: 128
+        invitationId:
+          type: string
+          format: uuid
+      additionalProperties: false
+
+    InvitationPreview:
+      type: object
+      required: [organization, invitedBy, roleLabels, expiresAt, next]
+      properties:
+        organization:
+          $ref: '#/components/schemas/OrganizationRef'
+        invitedBy:
+          type: string
+        roleLabels:
+          type: array
+          items:
+            type: string
+        expiresAt:
+          type: string
+          format: date-time
+        next:
+          type: string
+          enum: [create_password, sign_in, accept, sign_out_first]
+          description: >-
+            create_password : nouvelle personne, l'acceptation envoie l'e-mail Keycloak de
+            création du mot de passe ; sign_in : se connecter avec son compte habituel ;
+            accept : connectée avec l'identité invitée ; sign_out_first : connectée avec une
+            autre identité.
+
+    PasswordSetupSent:
+      type: object
+      required: [status, linkExpiresAt]
+      properties:
+        status:
+          type: string
+          const: password_email_sent
+        linkExpiresAt:
+          type: string
+          format: date-time
+          description: Fin de validité du lien Keycloak de création du mot de passe, 30 minutes après l'envoi.
+
+    ConfirmationReference:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+          minLength: 32
+          maxLength: 128
+          description: Lu dans le fragment du lien reçu par e-mail, jamais dans une adresse.
+      additionalProperties: false
+
+    ConfirmationPreview:
+      type: object
+      required: [purpose, expiresAt, next]
+      properties:
+        purpose:
+          type: string
+          enum: [email_change, email_change_cancel, mfa_reset, admin_recovery_veto]
+        emailMasked:
+          type: [string, 'null']
+          description: Adresse concernée, partiellement masquée.
+        organization:
+          oneOf:
+            - $ref: '#/components/schemas/OrganizationRef'
+            - type: 'null'
+        expiresAt:
+          type: string
+          format: date-time
+        next:
+          type: string
+          enum: [confirm, confirm_with_password, cancel]
+          description: >-
+            confirm_with_password : la confirmation passe par la saisie du mot de passe dans une page
+            Keycloak dédiée, toujours exigée, pour qu'un accès à la messagerie ne suffise pas.
+
+    ConfirmationResult:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [applied, password_required]
+        redirectUrl:
+          type: [string, 'null']
+          format: uri
+          description: >-
+            Pour password_required : page Keycloak, ouverte avec prompt=login et max_age=0, où la personne
+            saisit son mot de passe. Au retour, le back-end vérifie la personne et que l'authentification
+            est postérieure à l'envoi du lien, applique le changement et renvoie vers la page de
+            confirmation de l'application.
+
+    MembershipEnd:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+        endsOn:
+          type: [string, 'null']
+          format: date
+          description: Dernier jour inclus ; null pour aujourd'hui.
+      additionalProperties: false
+
+    PhoneReveal:
+      type: object
+      required: [phone]
+      properties:
+        phone:
+          $ref: '#/components/schemas/PhoneNumber'
+
+    AssignmentState:
+      type: string
+      enum: [pending_activation, planned, active, ended]
+
+    RoleRef:
+      type: object
+      required: [id, name, kind]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        kind:
+          $ref: '#/components/schemas/RoleKind'
+
+    Assignment:
+      type: object
+      required: [id, roles, startsOn, state, manageable, version]
+      properties:
+        id:
+          type: string
+          format: uuid
+        establishment:
+          oneOf:
+            - $ref: '#/components/schemas/EstablishmentRef'
+            - type: 'null'
+          description: Vide pour une affectation valable dans toute l'organisation.
+        roles:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/RoleRef'
+        startsOn:
+          type: string
+          format: date
+        endsOn:
+          type: [string, 'null']
+          format: date
+          description: 'Dernier jour inclus ; null : sans fin.'
+        state:
+          $ref: '#/components/schemas/AssignmentState'
+        manageable:
+          type: boolean
+          description: Vrai si l'acteur peut modifier cette affectation.
+        version:
+          type: integer
+
+    AssignmentInput:
+      type: object
+      required: [id, roleIds, startsOn]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid7'
+        establishmentId:
+          type: [string, 'null']
+          format: uuid
+          description: "null : toute l'organisation, pour des rôles de portée organisation."
+        roleIds:
+          type: array
+          minItems: 1
+          maxItems: 10
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+        startsOn:
+          type: string
+          format: date
+        endsOn:
+          type: [string, 'null']
+          format: date
+          description: 'Dernier jour inclus ; null : sans fin.'
+      additionalProperties: false
+
+    AssignmentUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        roleIds:
+          type: array
+          minItems: 1
+          maxItems: 10
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+        startsOn:
+          type: string
+          format: date
+        endsOn:
+          type: [string, 'null']
+          format: date
+          description: 'Dernier jour inclus ; null : sans fin.'
+      additionalProperties: false
+
+    RoleKind:
+      type: string
+      enum: [system, custom]
+
+    RoleScope:
+      type: string
+      enum: [organization, establishment]
+
+    RoleSummary:
+      type: object
+      required: [id, kind, name, scope, requiresMfa, assignedUserCount]
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          $ref: '#/components/schemas/RoleKind'
+        code:
+          type: [string, 'null']
+          description: Code des rôles système, par exemple ORG_ADMIN.
+        name:
+          type: string
+          description: Nom traduit pour un rôle système, saisi pour un rôle personnalisé.
+        scope:
+          $ref: '#/components/schemas/RoleScope'
+        requiresMfa:
+          type: boolean
+        assignedUserCount:
+          type: integer
+          minimum: 0
+
+    RoleDetail:
+      allOf:
+        - $ref: '#/components/schemas/RoleSummary'
+        - type: object
+          required: [permissions, version]
+          properties:
+            description:
+              type: [string, 'null']
+            permissions:
+              type: array
+              items:
+                $ref: '#/components/schemas/PermissionCode'
+            sourceRole:
+              oneOf:
+                - $ref: '#/components/schemas/RoleRef'
+                - type: 'null'
+            createdAt:
+              type: [string, 'null']
+              format: date-time
+            createdBy:
+              type: [string, 'null']
+            version:
+              type: integer
+
+    RoleCreate:
+      type: object
+      required: [id, sourceRoleId, name]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid7'
+        sourceRoleId:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 2
+          maxLength: 80
+        description:
+          type: [string, 'null']
+          maxLength: 300
+      additionalProperties: false
+
+    RoleUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 80
+        description:
+          type: [string, 'null']
+          maxLength: 300
+        permissions:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/PermissionCode'
+          description: Permissions que l'acteur détient lui-même (sinon 403 privilege-escalation), hors permissions réservées (sinon 409 reserved-permission).
+      additionalProperties: false
+
+    PermissionGroup:
+      type: object
+      required: [code, permissions]
+      properties:
+        code:
+          type: string
+          enum: [users, roles, audit, organization]
+        permissions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Permission'
+
+    Permission:
+      type: object
+      required: [code, requiresMfa, module, reserved]
+      properties:
+        code:
+          $ref: '#/components/schemas/PermissionCode'
+        requiresMfa:
+          type: boolean
+          description: "Toujours vrai au M0 : toutes ses permissions sont des permissions d'administration (RG-05)."
+        module:
+          type: string
+          const: M0
+
+        reserved:
+          type: boolean
+          description: >-
+            Réservée aux rôles système (gestion des rôles personnalisés, export du journal,
+            établissements, accès de support) : jamais dans un rôle personnalisé.
+
+    AuditOutcome:
+      type: string
+      enum: [success, failure, denied]
+
+    AuditAction:
+      type: string
+      enum:
+        - auth.session.opened
+        - auth.session.closed
+        - auth.session.expired
+        - auth.session.locked
+        - auth.session.unlocked
+        - auth.login.failed
+        - auth.account.locked
+        - auth.account.unlocked
+        - auth.mfa.enrolled
+        - auth.mfa.reset
+        - auth.mfa.reset.requested
+        - auth.mfa.reset.cancelled
+        - auth.mfa.removed
+        - auth.password.changed
+        - auth.password.reset
+        - context.establishment.selected
+        - user.invited
+        - user.created
+        - user.invitation.resent
+        - user.invitation.cancelled
+        - user.invitation.accepted
+        - user.invitation.declined
+        - user.updated
+        - user.login-change.requested
+        - user.login-change.confirmed
+        - user.login-change.cancelled
+        - user.temporary-password.issued
+        - user.suspended
+        - user.reactivated
+        - user.membership.ended
+        - user.membership.left
+        - user.phone.revealed
+        - assignment.created
+        - assignment.updated
+        - assignment.ended
+        - assignment.deleted
+        - role.created
+        - role.updated
+        - establishment.created
+        - establishment.updated
+        - organization.created
+        - organization.updated
+        - organization.suspended
+        - organization.reactivated
+        - organization.admin-recovery.requested
+        - organization.admin-recovery.approved
+        - organization.admin-recovery.vetoed
+        - organization.admin-recovery.cancelled
+        - organization.contract-contact.changed
+        - support.requested
+        - support.granted
+        - support.denied
+        - support.revoked
+        - support.expired
+        - support.entered
+        - support.left
+        - support.data.viewed
+        - audit.exported
+
+    AuditActor:
+      type: object
+      description: "Nom et rôle figés au moment de l'action, conservés avec les détails effaçables : « Détail effacé » après un effacement."
+      required: [label]
+      properties:
+        userId:
+          type: [string, 'null']
+          format: uuid
+          description: Identifiant dans l'organisation consultée ; vide pour un auteur inconnu ou de la plateforme.
+        label:
+          type: string
+          examples: [Brice Kamga, Inconnu, 'Grace Nkeng, équipe AfrikCareUnited']
+        roleLabel:
+          type: [string, 'null']
+
+    AuditTarget:
+      type: object
+      required: [type, label]
+      properties:
+        type:
+          type: string
+          enum: [user, assignment, role, establishment, organization, support_access, audit_export, session, none]
+        id:
+          type: [string, 'null']
+          format: uuid
+        label:
+          type: string
+
+    AuditEventSummary:
+      type: object
+      required: [id, occurredAt, actor, action, outcome]
+      properties:
+        id:
+          type: string
+          format: uuid
+        occurredAt:
+          type: string
+          format: date-time
+        actor:
+          $ref: '#/components/schemas/AuditActor'
+        action:
+          $ref: '#/components/schemas/AuditAction'
+        target:
+          oneOf:
+            - $ref: '#/components/schemas/AuditTarget'
+            - type: 'null'
+        establishment:
+          oneOf:
+            - $ref: '#/components/schemas/EstablishmentRef'
+            - type: 'null'
+        ipAddress:
+          type: [string, 'null']
+          description: >-
+            Adresse du poste, lue dans X-Forwarded-For seulement quand la requête vient du proxy de
+            confiance ; conservée avec les détails effaçables. Absente pour les événements de l'identité
+            (« Compte bloqué », « Double authentification réinitialisée ») et dans l'historique d'une fiche.
+        outcome:
+          $ref: '#/components/schemas/AuditOutcome'
+
+    AuditChange:
+      type: object
+      required: [field]
+      properties:
+        field:
+          type: string
+          examples: [assignment.endsOn]
+        before:
+          description: Valeur avant ; absente pour une création.
+        after:
+          description: Valeur après ; absente pour une suppression.
+
+    AuditIntegrity:
+      type: object
+      required: [status, checkedAt]
+      description: >-
+        Toute altération d'une entrée couverte par un point de contrôle est détectable : l'entrée
+        et sa chaîne sont recalculées jusqu'à un point de contrôle signé, conservé hors de la base
+        et produit toutes les 15 minutes.
+      properties:
+        status:
+          type: string
+          enum: [verified, pending, broken]
+          description: >-
+            verified : la chaîne est vérifiée jusqu'à un point de contrôle qui couvre l'entrée.
+            pending : entrée plus récente que le dernier point de contrôle (15 minutes au plus).
+            broken : une empreinte ne correspond plus.
+        checkedAt:
+          type: string
+          format: date-time
+        checkpointAt:
+          type: [string, 'null']
+          format: date-time
+          description: Point de contrôle signé qui couvre cette entrée ; null tant qu'il n'existe pas.
+
+    AuditEventDetail:
+      allOf:
+        - $ref: '#/components/schemas/AuditEventSummary'
+        - type: object
+          required: [requestId, changes, integrity, detailsErased]
+          properties:
+            device:
+              type: [string, 'null']
+              examples: [Chrome sur Windows]
+            requestId:
+              type: string
+              format: uuid
+            changes:
+              type: array
+              items:
+                $ref: '#/components/schemas/AuditChange'
+            details:
+              type: object
+              additionalProperties: true
+            integrity:
+              $ref: '#/components/schemas/AuditIntegrity'
+
+            detailsErased:
+              type: boolean
+              description: >-
+                Détails personnels effacés à la demande (effacement ou correction) : noms, adresse IP, état
+                avant et après. L'empreinte de l'entrée reste vérifiable, car elle ne porte que sur des
+                identifiants techniques et sur une empreinte salée de ces détails.
+
+    AuditEventPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/AuditEventSummary'
+
+    IdentitySecurityEvent:
+      type: object
+      required: [id, occurredAt, action, outcome]
+      description: Événement de sécurité de l'identité, visible de la personne seule et de l'équipe AfrikCareUnited.
+      properties:
+        id:
+          type: string
+          format: uuid
+        occurredAt:
+          type: string
+          format: date-time
+        action:
+          $ref: '#/components/schemas/AuditAction'
+        ipAddress:
+          type: [string, 'null']
+        device:
+          type: [string, 'null']
+        outcome:
+          $ref: '#/components/schemas/AuditOutcome'
+
+    IdentitySecurityEventPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/IdentitySecurityEvent'
+
+    AuditExportRequest:
+      type: object
+      required: [from, to]
+      properties:
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        actorId:
+          type: [string, 'null']
+          format: uuid
+        actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditAction'
+        establishmentId:
+          type: [string, 'null']
+          format: uuid
+        outcome:
+          oneOf:
+            - $ref: '#/components/schemas/AuditOutcome'
+            - type: 'null'
+        targetId:
+          type: [string, 'null']
+          format: uuid
+      additionalProperties: false
+
+    PlatformOrganizationSummary:
+      type: object
+      required: [id, name, establishmentCount, firstAdmin, defaultLocale, status, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        establishmentCount:
+          type: integer
+          minimum: 0
+        firstAdmin:
+          type: object
+          required: [displayName, invitationPending]
+          properties:
+            displayName:
+              type: string
+            invitationPending:
+              type: boolean
+          description: Nom saisi à l'ouverture, conservé par la plateforme ; seul l'état de l'invitation est lu dans l'organisation, par une fonction dédiée.
+        defaultLocale:
+          $ref: '#/components/schemas/Locale'
+        status:
+          $ref: '#/components/schemas/OrganizationStatus'
+        createdAt:
+          type: string
+          format: date-time
+
+    PlatformOrganizationPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/PlatformOrganizationSummary'
+
+    PlatformOrganizationDetail:
+      allOf:
+        - $ref: '#/components/schemas/PlatformOrganizationSummary'
+        - type: object
+          required: [establishments, supportAccess, version, code, timezone, contractContact]
+          properties:
+            suspensionReason:
+              type: [string, 'null']
+            establishments:
+              type: array
+              items:
+                $ref: '#/components/schemas/Establishment'
+            supportAccess:
+              type: array
+              description: Demande en attente ou accès en cours, puis les plus récents.
+              items:
+                $ref: '#/components/schemas/SupportAccess'
+            version:
+              type: integer
+
+            code:
+              type: string
+            timezone:
+              type: string
+            contractContact:
+              $ref: '#/components/schemas/ContractContact'
+
+            adminRecoveries:
+              type: array
+              description: Procédures de nomination d'un administrateur de secours, en cours puis récentes.
+              items:
+                $ref: '#/components/schemas/AdminRecovery'
+
+    PlatformOrganizationCreate:
+      type: object
+      required: [id, name, code, defaultLocale, establishments, firstAdmin, contractContact]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid7'
+        name:
+          type: string
+          minLength: 2
+          maxLength: 120
+        code:
+          type: string
+          pattern: '^[a-z0-9]{2,10}$'
+          description: Code court, unique et définitif ; préfixe des identifiants attribués.
+        defaultLocale:
+          $ref: '#/components/schemas/Locale'
+        timezone:
+          type: string
+          maxLength: 64
+          description: Africa/Douala par défaut.
+        establishments:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/EstablishmentCreate'
+        firstAdmin:
+          type: object
+          required: [givenName, familyName, email, locale]
+          properties:
+            givenName:
+              $ref: '#/components/schemas/PersonName'
+            familyName:
+              $ref: '#/components/schemas/PersonName'
+            email:
+              type: string
+              format: email
+              maxLength: 254
+            locale:
+              $ref: '#/components/schemas/Locale'
+          additionalProperties: false
+        contractContact:
+          $ref: '#/components/schemas/ContractContact'
+      additionalProperties: false
+
+    PlatformOrganizationUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 120
+        defaultLocale:
+          $ref: '#/components/schemas/Locale'
+        timezone:
+          type: string
+          maxLength: 64
+        contractContact:
+          $ref: '#/components/schemas/ContractContact'
+      additionalProperties: false
+
+    ContractContact:
+      type: object
+      required: [name, email]
+      description: >-
+        Signataire du contrat côté client : prévenu des opérations sensibles de la plateforme
+        sur l'organisation, comme la nomination d'un administrateur de secours.
+      properties:
+        name:
+          type: string
+          maxLength: 120
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        phone:
+          oneOf:
+            - $ref: '#/components/schemas/PhoneNumber'
+            - type: 'null'
+      additionalProperties: false
+
+    PlatformAdminRecovery:
+      type: object
+      required: [ticket, reason, givenName, familyName, email, locale]
+      properties:
+        ticket:
+          type: string
+          maxLength: 40
+          description: Référence de la demande écrite du client.
+        reason:
+          type: string
+          maxLength: 500
+        givenName:
+          $ref: '#/components/schemas/PersonName'
+        familyName:
+          $ref: '#/components/schemas/PersonName'
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        locale:
+          $ref: '#/components/schemas/Locale'
+      additionalProperties: false
+
+    AdminRecovery:
+      type: object
+      required: [id, organization, requestedBy, status, ticket, reason, createdAt]
+      description: >-
+        Demandée par un membre de l'équipe, approuvée par un autre, puis exécutée après 72 h si
+        personne ne s'y oppose : le signataire du contrat, son prédécesseur s'il a changé dans les
+        30 derniers jours, et les administrateurs en place reçoivent un lien d'opposition.
+      properties:
+        id:
+          type: string
+          format: uuid
+        organization:
+          $ref: '#/components/schemas/OrganizationRef'
+        requestedBy:
+          type: string
+        approvedBy:
+          type: [string, 'null']
+        status:
+          type: string
+          enum: [pending_approval, waiting, executed, vetoed, cancelled]
+        ticket:
+          type: string
+        reason:
+          type: string
+        executesAt:
+          type: [string, 'null']
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time

@@ -1,0 +1,91 @@
+# AfrikCareUnited — environnement local (lot L1) : PostgreSQL 18, Keycloak 26.8 avec ses deux realms, Mailpit.
+# Démarrage : cd infra && ./generer-env.sh && docker compose up -d
+# Aucun secret ici : tout vient de infra/.env (non versionné), créé par generer-env.sh.
+# Les ports ne sont ouverts que sur la machine locale (127.0.0.1).
+name: afrikcareunited
+
+services:
+  postgres:
+    image: postgres:18.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${ACU_PG_SUPERUSER_PASSWORD:?à définir dans infra/.env}
+      POSTGRES_DB: postgres
+      ACU_DB_OWNER_PASSWORD: ${ACU_DB_OWNER_PASSWORD:?à définir dans infra/.env}
+      ACU_DB_APP_PASSWORD: ${ACU_DB_APP_PASSWORD:?à définir dans infra/.env}
+      ACU_DB_PLATFORM_PASSWORD: ${ACU_DB_PLATFORM_PASSWORD:?à définir dans infra/.env}
+      ACU_DB_AUDIT_PASSWORD: ${ACU_DB_AUDIT_PASSWORD:?à définir dans infra/.env}
+      ACU_KEYCLOAK_DB_PASSWORD: ${ACU_KEYCLOAK_DB_PASSWORD:?à définir dans infra/.env}
+      TZ: UTC
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # Depuis PostgreSQL 18, l'image range les données sous /var/lib/postgresql/18/docker.
+      - postgres-donnees:/var/lib/postgresql
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d afrikcareunited"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.1
+    restart: unless-stopped
+    # start-dev : HTTP et caches locaux, réservés au poste de développement ; les realms sont importés au démarrage.
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${ACU_KEYCLOAK_DB_PASSWORD:?à définir dans infra/.env}
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${ACU_KEYCLOAK_ADMIN_USER:-admin-local}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${ACU_KEYCLOAK_ADMIN_PASSWORD:?à définir dans infra/.env}
+      KC_HOSTNAME: http://localhost:8180
+      KC_HEALTH_ENABLED: "true"
+      KC_HTTP_PORT: "8080"
+      # Valeurs reprises dans les fichiers des realms (marqueurs ${...}).
+      ACU_PUBLIC_URL: ${ACU_PUBLIC_URL:-http://localhost:4220}
+      ACU_BACKEND_INTERNAL_URL: ${ACU_BACKEND_INTERNAL_URL:-http://host.docker.internal:8086}
+      ACU_KEYCLOAK_BFF_SECRET: ${ACU_KEYCLOAK_BFF_SECRET:?à définir dans infra/.env}
+      ACU_KEYCLOAK_EQUIPE_BFF_SECRET: ${ACU_KEYCLOAK_EQUIPE_BFF_SECRET:?à définir dans infra/.env}
+      ACU_KEYCLOAK_CONFIRM_SECRET: ${ACU_KEYCLOAK_CONFIRM_SECRET:?à définir dans infra/.env}
+      ACU_KEYCLOAK_ADMIN_SECRET: ${ACU_KEYCLOAK_ADMIN_SECRET:?à définir dans infra/.env}
+      ACU_SMTP_HOST: mailpit
+      ACU_SMTP_PORT: "1025"
+      ACU_SMTP_FROM: ${ACU_SMTP_FROM:-no-reply@afrikcareunited.example}
+    ports:
+      - "127.0.0.1:8180:8080"
+    volumes:
+      - ./keycloak/realms:/opt/keycloak/data/import:ro
+      - ./keycloak/password-blacklists:/opt/keycloak/data/password-blacklists:ro
+    extra_hosts:
+      # Déconnexion signalée par Keycloak au back-end lancé sur le poste (mvn spring-boot:run).
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    healthcheck:
+      # Sondes de Keycloak sur son port d'administration (9000) ; l'image n'a pas curl.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  mailpit:
+    image: axllent/mailpit:v1.32.0
+    restart: unless-stopped
+    # Aucun e-mail ne part : Mailpit garde tout, consultable sur http://localhost:8025.
+    environment:
+      MP_MAX_MESSAGES: "5000"
+      MP_SMTP_DISABLE_RDNS: "true"
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+
+volumes:
+  postgres-donnees:

@@ -1,0 +1,15 @@
+# Construction
+/target/
+*.class
+
+# Configuration locale : jamais de secret dans le dépôt
+infra/.env
+.env
+.env.*
+!infra/.env.example
+
+# Éditeurs
+.idea/
+*.iml
+.vscode/
+.DS_Store

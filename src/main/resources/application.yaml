@@ -1,0 +1,132 @@
+# AfrikCareUnited — configuration du back-end.
+# Aucun secret ici : mots de passe et secrets viennent de l'environnement (infra/.env en local, coffre au déploiement).
+# Les valeurs par défaut visent l'environnement local d'infra/docker-compose.yml.
+
+spring:
+  application:
+    name: afrikcareunited-back
+  threads:
+    virtual:
+      enabled: true
+
+  # Pool des requêtes des organisations : rôle acu_app, soumis à la Row-Level Security.
+  # Les pools acu_platform et acu_audit s'ajoutent au lot L2 (conception, « Isolation des organisations »).
+  datasource:
+    url: ${ACU_DB_URL:jdbc:postgresql://localhost:5432/afrikcareunited}
+    username: ${ACU_DB_APP_USER:acu_app}
+    password: ${ACU_DB_APP_PASSWORD}
+
+  # Migrations : rôle propriétaire acu_owner, jamais utilisé par l'application.
+  flyway:
+    enabled: true
+    url: ${ACU_DB_URL:jdbc:postgresql://localhost:5432/afrikcareunited}
+    user: ${ACU_DB_OWNER_USER:acu_owner}
+    password: ${ACU_DB_OWNER_PASSWORD}
+    schemas: org,iam,platform,audit,ops
+    create-schemas: true
+    locations: classpath:db/migration
+
+  # Connexion par Keycloak, côté serveur (BFF) : deux realms, aucun jeton transmis au navigateur.
+  security:
+    oauth2:
+      client:
+        registration:
+          keycloak:
+            provider: keycloak
+            client-id: acu-bff
+            client-secret: ${ACU_KEYCLOAK_BFF_SECRET}
+            authorization-grant-type: authorization_code
+            scope: openid
+            redirect-uri: "{baseUrl}/api/v1/auth/callback/{registrationId}"
+          keycloak-equipe:
+            provider: keycloak-equipe
+            client-id: acu-bff
+            client-secret: ${ACU_KEYCLOAK_EQUIPE_BFF_SECRET}
+            authorization-grant-type: authorization_code
+            scope: openid
+            redirect-uri: "{baseUrl}/api/v1/auth/callback/{registrationId}"
+        provider:
+          keycloak:
+            issuer-uri: ${ACU_KEYCLOAK_URL:http://localhost:8180}/realms/afrikcareunited
+            user-name-attribute: sub
+          keycloak-equipe:
+            issuer-uri: ${ACU_KEYCLOAK_URL:http://localhost:8180}/realms/afrikcareunited-equipe
+            user-name-attribute: sub
+
+  # Sessions du navigateur : tables de Spring Session, créées par migration et vidées après une restauration.
+  session:
+    timeout: 12h
+    jdbc:
+      initialize-schema: never
+      table-name: ops.spring_session
+
+  # Boîte d'envoi des événements internes et des e-mails (table créée par migration).
+  modulith:
+    events:
+      jdbc:
+        schema-initialization:
+          enabled: false
+        schema: ops
+      republish-outstanding-events-on-restart: true
+
+  # SMTP paramétré par environnement ; Mailpit en local et en test, aucun envoi réel (D-12).
+  mail:
+    host: ${ACU_SMTP_HOST:localhost}
+    port: ${ACU_SMTP_PORT:1025}
+    username: ${ACU_SMTP_USER:}
+    password: ${ACU_SMTP_PASSWORD:}
+
+server:
+  # 8080 dans les conteneurs ; 8086 sur le poste de développement (profil local, D-26).
+  port: ${ACU_HTTP_PORT:8080}
+  # Derrière nginx (application servie à part) et le répartiteur de l'hébergeur.
+  forward-headers-strategy: framework
+  error:
+    include-stacktrace: never
+    include-message: never
+  servlet:
+    session:
+      cookie:
+        name: __Host-acu_session
+        http-only: true
+        secure: true
+        same-site: lax
+        path: /
+
+# Sondes de santé et métriques sur un port d'administration non exposé.
+management:
+  server:
+    port: ${ACU_MANAGEMENT_PORT:8081}
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+
+# Journaux structurés (JSON), sans données personnelles.
+logging:
+  structured:
+    format:
+      console: ${ACU_LOG_FORMAT:ecs}
+
+# Règles du M0 (conception détaillée v0.1), paramétrables : les tests les raccourcissent.
+acu:
+  public-url: ${ACU_PUBLIC_URL:http://localhost:4220}
+  environment: ${ACU_ENVIRONMENT:development}
+  demo-data: ${ACU_DEMO_DATA:true}
+  session:
+    idle-lock: 15m
+    lock-warning: 60s
+    locked-max: 2h
+    absolute-max: 12h
+  invitation:
+    validity: 72h
+  keycloak:
+    admin-client-id: acu-admin
+    admin-client-secret: ${ACU_KEYCLOAK_ADMIN_SECRET}
+    password-setup-link-validity: 30m
+    events-poll-interval: 30s

@@ -1,0 +1,14 @@
+# Profil local (mvn spring-boot:run -Dspring-boot.run.profiles=local) avec infra/docker-compose.yml.
+# Les secrets restent dans infra/.env, chargé dans l'environnement avant le lancement.
+# Les cookies __Host- (Secure) sont acceptés sur http://localhost par Chrome, Edge et Firefox.
+
+# Ports du poste de développement (D-26) : le back-end écoute sur 8086 ; l'application Angular (npm start, port 4220)
+# relaie /api vers ce port (proxy.conf.json du front). ACU_HTTP_PORT, s'il est défini, reste prioritaire.
+server:
+  port: ${ACU_HTTP_PORT:8086}
+
+logging:
+  structured:
+    format:
+      # Journaux lisibles en local ; JSON partout ailleurs.
+      console: ''

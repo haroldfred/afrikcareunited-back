@@ -1,0 +1,5 @@
+# Parcours /auth : la réponse de succès est une redirection 302 vers Keycloak, sans corps JSON.
+contracts/afrikcareunited-m0-openapi.yaml:
+  operation-2xx-response:
+    - '#/paths/~1auth~1login/get/responses'
+    - '#/paths/~1auth~1reauth/get/responses'
